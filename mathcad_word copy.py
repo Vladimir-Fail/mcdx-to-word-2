@@ -23,6 +23,9 @@ class MathcadParser:
     sig_figs_small = 4
     sig_figs_large = 8
 
+    # Количество знаков после запятой для угла в полярной форме.
+    ANGLE_DECIMALS = 1
+
     @staticmethod
     def strip_ns(tag):
         """Удаляет namespace из XML-тега или атрибута."""
@@ -85,6 +88,25 @@ class MathcadParser:
             return str(num_str).replace(".", ",")
 
     @classmethod
+    def format_angle_value(cls, angle):
+        """
+        Форматирует угол в полярной форме: всегда ровно
+        ANGLE_DECIMALS знаков после запятой, разделитель — запятая.
+        """
+        try:
+            value = float(angle)
+        except (ValueError, TypeError):
+            return str(angle).replace(".", ",")
+
+        # Убираем "минус ноль".
+        if math.isclose(value, 0.0, abs_tol=1e-12):
+            value = 0.0
+
+        text = f"{value:.{cls.ANGLE_DECIMALS}f}"
+
+        return text.replace(".", ",")
+
+    @classmethod
     def find_first_by_tag(cls, node, tag):
         """Ищет первый дочерний элемент по имени тега."""
         if node is None:
@@ -133,13 +155,11 @@ class MathcadParser:
         base = (node.text or "").strip()
         subscript = None
 
-        # Индекс может быть записан атрибутом XML.
         for key, value in node.attrib.items():
             if cls.strip_ns(key) == "subscript":
                 subscript = value
                 break
 
-        # Индекс может быть отдельным дочерним узлом.
         for child in node:
             tag = cls.strip_ns(child.tag)
 
@@ -149,8 +169,6 @@ class MathcadParser:
             elif tag in ("name", "id", "sym") and not base:
                 base = "".join(child.itertext()).strip()
 
-        # Основной вариант Mathcad:
-        # имя с точкой является именем с литеральным индексом.
         if subscript is None and "." in base:
             base, subscript = base.split(".", 1)
 
@@ -260,6 +278,9 @@ class MathcadParser:
     def parse_complex(cls, real_value, imag_value, imag_symbol="i"):
         """
         Преобразует a + jb в |z|∠угол°.
+
+        Угол всегда округляется до ANGLE_DECIMALS знаков
+        после запятой (по умолчанию 1).
         """
         try:
             modulus, angle = cls.calculate_complex_polar(
@@ -279,7 +300,7 @@ class MathcadParser:
             return f"{real_text}{sign}{imag_text}{imag_symbol}"
 
         modulus_text = cls.format_num(str(modulus))
-        angle_text = cls.format_num(str(angle))
+        angle_text = cls.format_angle_value(angle)
 
         return (
             rf"{modulus_text}"
@@ -565,7 +586,7 @@ class MathcadParser:
 
     @staticmethod
     def _ends_with_digit(text):
-        """Проверяет, заканчивается ли текст цифрой (с учётом } )"""
+        """Проверяет, заканчивается ли текст цифрой (с учётом } )."""
         stripped = text.strip().rstrip("} \t")
         return bool(stripped) and stripped[-1].isdigit()
 
@@ -578,7 +599,6 @@ class MathcadParser:
         """
         n = len(args)
 
-        # --- Классификация ---
         factors = []
         for i in range(n):
             arg = args[i]
@@ -598,7 +618,7 @@ class MathcadParser:
                 "prefix_one": False,
             })
 
-        # --- Шаг 1: объединяем явную единицу перед углом ---
+        # Шаг 1: объединяем явную единицу перед углом.
         for i, f in enumerate(factors):
             if not f["is_angle"] or f["has_one_angle"]:
                 continue
@@ -615,7 +635,7 @@ class MathcadParser:
                 factors[merge_idx]["keep"] = False
                 f["prefix_one"] = True
 
-        # --- Шаг 2: определяем, где ещё нужна "1" ---
+        # Шаг 2: определяем, где ещё нужна "1".
         for i, f in enumerate(factors):
             if not f["is_angle"] or f["has_one_angle"]:
                 continue
@@ -638,17 +658,17 @@ class MathcadParser:
             prev_text = factors[prev_idx]["text"].strip()
 
             if cls._is_pure_number_latex(prev_text):
-                # Обычное число (не 1) → единица не нужна
+                # Обычное число (не 1) → единица не нужна.
                 pass
             elif cls._is_simple_coefficient(prev_text):
-                # Переменная: если заканчивается цифрой — добавляем "1"
+                # Переменная: если заканчивается цифрой — добавляем "1".
                 if cls._ends_with_digit(prev_text):
                     f["prefix_one"] = True
             else:
-                # Выражение (скобки и т.п.) → добавляем "1"
+                # Выражение (скобки и т.п.) → добавляем "1".
                 f["prefix_one"] = True
 
-        # --- Шаг 3: собираем результат ---
+        # Шаг 3: собираем результат.
         parts = []
         for f in factors:
             if not f["keep"]:
@@ -960,7 +980,6 @@ class MathcadParser:
                         second_node.text.strip()
                         if second_node.text else "0"
                     )
-                    # Вычитание: real - imag*i
                     try:
                         imag_value = str(-float(imag_value_raw))
                     except (ValueError, TypeError):
