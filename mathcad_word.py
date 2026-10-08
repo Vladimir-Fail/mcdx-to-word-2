@@ -482,27 +482,15 @@ class MathcadParser:
         Преобразует угол φ из показателя exp(1i·deg·φ)
         в запись с символом угла: ∠φ°.
 
-        Если перед знаком угла нет числового или буквенного
-        множителя (например, "голый" e^(1j·deg·30)),
-        впереди добавляется единица: 1∠30°.
+        Ведущая единица НЕ добавляется здесь: решение о ней
+        принимает обработчик умножения (есть ли реальный
+        множитель перед углом) или точка входа парсинга для
+        одиночного угла (parse_node_to_latex_root).
         """
         if not angle_latex:
-            return r"1\angle^{\circ}"
+            return r"\angle^{\circ}"
 
-        stripped = angle_latex.lstrip()
-
-        first_char = stripped[0] if stripped else ""
-
-        starts_with_operand = bool(
-            cls.ANGLE_MARK_RE.match(stripped)
-            or re.match(r"^[-\d,.]", stripped)
-            or re.match(r"^\\[a-zA-Z]", stripped)
-            or re.match(r"^[{]", stripped)
-        ) or first_char.isalpha()
-
-        prefix = "" if starts_with_operand else "1"
-
-        return rf"{prefix}\angle{angle_latex}^{{\circ}}"
+        return rf"\angle{angle_latex}^{{\circ}}"
 
     @classmethod
     def parse_complex_node(cls, node):
@@ -798,6 +786,72 @@ class MathcadParser:
         )
 
     @classmethod
+    def parse_node_to_latex_root(cls, node):
+        """
+        Точка входа парсинга узла.
+
+        Разворачивает все защищённые метки @@ANGLEn@@, которые
+        могли остаться неразвёрнутыми (например, одиночный угол
+        без внешнего умножения), и очищает стек меток.
+        """
+        try:
+            latex = cls.parse_node_to_latex(node)
+
+        finally:
+            marks = cls.pop_all_angle_marks()
+
+        if marks:
+            for mark, angle_latex in marks.items():
+                # Строка целиком состоит из метки (или
+                # "\angle"+метки) — это одиночная конструкция
+                # e^(1j·deg·φ) без множителя: добавляем единицу.
+                if latex.strip().replace(mark, "") == r"\angle":
+                    latex = "1" + angle_latex
+                    continue
+
+                if latex.strip() == mark:
+                    latex = "1" + angle_latex
+                    continue
+
+                bare = rf"\angle{mark}"
+
+                if bare in latex:
+                    latex = latex.replace(
+                        bare, rf"1{angle_latex}", 1
+                    )
+
+            latex = cls.restore_angle_symbols(latex, marks)
+
+        # Метка угла может лежать внутри обёрток (parens,
+        # symResult, ...). Разворачиваем её здесь, чтобы
+        # внешние обработчики видели готовую запись.
+        if "@@ANGLE" in latex:
+            marks = cls.pop_all_angle_marks()
+
+            if marks:
+                for mark, angle_latex in marks.items():
+                    stripped_latex = latex.strip()
+
+                    if (
+                        stripped_latex == mark
+                        or stripped_latex.replace(mark, "")
+                        == r"\angle"
+                    ):
+                        latex = "1" + angle_latex
+                        continue
+
+                    bare = rf"\angle{mark}"
+
+                    if bare in latex:
+                        latex = latex.replace(
+                            bare, rf"1{angle_latex}", 1
+                        )
+
+                latex = cls.restore_angle_symbols(latex, marks)
+
+        return latex
+
+    @classmethod
     def parse_node_to_latex(cls, node):
         """Рекурсивно преобразует XML-узел Mathcad в LaTeX."""
         if node is None:
@@ -941,10 +995,58 @@ class MathcadParser:
 
             if op == "mult":
                 def is_angle_mark(text):
-                    """Узел — целиком защищённая метка угла."""
+                    """Узел — готовая запись угла (возможно, в скобках)."""
                     return bool(
                         cls.ANGLE_MARK_RE.fullmatch(text.strip())
+                        or re.fullmatch(
+                            r"(?:\\left\()?1?\\angle[^)]*(?:\\right\))?",
+                            text.strip()
+                        )
                     )
+
+                def has_real_operand_before(idx):
+                    """
+                    Есть ли перед меткой угла значимый множитель
+                    (число, переменная, функция, скобка), который
+                    доживает до результата. Только в этом случае
+                    угол пишется без ведущей единицы.
+                    Нули и единицы (будут убраны/заменены) — не
+                    считаются.
+                    """
+                    for j in range(1, idx):
+                        arg_text = (args[j] or "").strip()
+
+                        if not arg_text:
+                            continue
+
+                        if cls.is_unit_factor(children[1 + j]):
+                            continue
+
+                        if re.match(r"^[+-]?[\d,.]+$", arg_text):
+                            try:
+                                value = float(
+                                    arg_text.replace(",", ".")
+                                )
+                            except ValueError:
+                                value = None
+
+                            if value in (None, 0.0):
+                                continue
+
+                        return True
+
+                    return False
+
+                # Меткам углов без реального множителя слева
+                # дописываем единицу: I2·0·e^(1j·deg·30) или
+                # голый e^(1j·deg·30) -> 1\angle30^\circ.
+                for idx, arg in enumerate(args):
+                    if (
+                        is_angle_mark(arg)
+                        and "1\\angle" not in arg
+                        and not has_real_operand_before(idx)
+                    ):
+                        args[idx] = "1" + arg
 
                 # 1) Явная единица перед знаком угла оставляем:
                 #    1·e^(1j·deg·30) -> 1\angle30^\circ
@@ -972,6 +1074,7 @@ class MathcadParser:
 
                     if (
                         is_angle_mark(arg)
+                        and not arg.strip().startswith("1")
                         and cls.is_unit_factor(operand_node)
                     ):
                         continue
@@ -1205,6 +1308,28 @@ class MathcadParser:
         return ""
 
     @classmethod
+    def parse_eval_to_latex_root(cls, node):
+        """Точка входа для eval-регионов (см. parse_node_to_latex_root)."""
+        try:
+            latex = cls.parse_eval_to_latex(node)
+
+        finally:
+            marks = cls.pop_all_angle_marks()
+
+        if marks:
+            for mark, angle_latex in marks.items():
+                bare = rf"\angle{mark}"
+
+                if bare in latex:
+                    latex = latex.replace(
+                        bare, rf"1{angle_latex}", 1
+                    )
+
+            latex = cls.restore_angle_symbols(latex, marks)
+
+        return latex
+
+    @classmethod
     def parse_eval_to_latex(cls, node):
         """
         Обрабатывает eval.
@@ -1392,13 +1517,13 @@ class MathcadParser:
                             right_side.tag
                         ) == "eval":
                             right_latex = (
-                                cls.parse_eval_to_latex(
+                                cls.parse_eval_to_latex_root(
                                     right_side
                                 )
                             )
                         else:
                             right_latex = (
-                                cls.parse_node_to_latex(
+                                cls.parse_node_to_latex_root(
                                     right_side
                                 )
                             )
@@ -1412,12 +1537,12 @@ class MathcadParser:
                             latex = left_side
 
                 elif tag == "eval":
-                    latex = cls.parse_eval_to_latex(
+                    latex = cls.parse_eval_to_latex_root(
                         child
                     )
 
                 else:
-                    latex = cls.parse_node_to_latex(
+                    latex = cls.parse_node_to_latex_root(
                         child
                     )
 
