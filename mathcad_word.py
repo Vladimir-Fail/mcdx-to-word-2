@@ -1,5 +1,6 @@
 import math
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 import tkinter as tk
@@ -326,58 +327,143 @@ class MathcadParser:
         )
 
     @staticmethod
-    def is_degree_unit(latex):
-        """Проверяет, что узел — единица измерения deg."""
-        return latex.strip() == r"\mathrm{deg}"
-
-    @staticmethod
-    def is_polar_exponent(latex):
+    def is_degree_unit(node):
         """
-        Проверяет, что узел — показатель вида 1i·deg·φ
-        (или 1j·deg·φ), то есть запись угла в
-        экспоненциальной форме e^(1i·deg·φ).
+        Проверяет, что XML-узел — единица измерения deg.
+
+        Пример Mathcad: <id>deg</id>
         """
-        text = latex.strip()
+        if node is None:
+            return False
 
-        pattern = (
-            r"\\left\(\s*"
-            r"1[ij]\s*\\cdot\s*\\mathrm\{deg\}"
-            r"(?:\s*\\cdot\s*(?P<angle>.+?))?"
-            r"\s*\\right\)"
-        )
+        if MathcadParser.strip_ns(node.tag) != "id":
+            return False
 
-        match = re.fullmatch(pattern, text)
+        return (node.text or "").strip() == "deg"
 
-        if match:
-            return True, match.group("angle") or ""
+    @classmethod
+    def is_euler_base(cls, node):
+        """
+        Проверяет, что узел — константа e (основание
+        экспоненты).
 
-        # Вариант без скобок: 1i \cdot \mathrm{deg} · φ
-        pattern_simple = (
-            r"1[ij]\s*\\cdot\s*\\mathrm\{deg\}"
-            r"(?:\s*\\cdot\s*(?P<angle>.+))?"
-        )
+        Mathcad записывает её как <id>e</id> или <e/>.
+        """
+        if node is None:
+            return False
 
-        match = re.fullmatch(pattern_simple, text)
+        tag = cls.strip_ns(node.tag)
 
-        if match:
-            return True, match.group("angle") or ""
+        if tag == "e":
+            return True
 
-        return False, None
+        if tag in ("id", "sym"):
+            base = (node.text or "").strip()
+
+            # Имя с индексом — это переменная, а не константа e
+            for key in node.attrib:
+                if cls.strip_ns(key) == "subscript":
+                    return False
+
+            return base == "e"
+
+        return False
+
+    @classmethod
+    def extract_polar_angle_degrees(cls, node):
+        """
+        Пытается распознать показатель степени вида
+        1i·deg·φ (запись угла в градусах в экспоненциальной
+        форме e^(1i·deg·φ)).
+
+        Структура XML Mathcad:
+
+            <apply>
+                <mult/>
+                <apply>
+                    <mult/>
+                    <imag symbol="j">1</imag>   (или 1i / 1j)
+                    <id>deg</id>
+                </apply>
+                <real>120</real>               (сам угол)
+            </apply>
+
+        Возвращает LaTeX-строку угла (число или выражение)
+        либо None, если узел не является полярным показателем.
+        """
+        if node is None:
+            return None
+
+        children = list(node)
+
+        if not children:
+            return None
+
+        op = cls.strip_ns(children[0].tag)
+
+        if op != "mult":
+            return None
+
+        operands = children[1:]
+
+        if len(operands) < 2:
+            return None
+
+        def operand_is_i_times_deg(operand):
+            """Группа 1i · deg (порядок множителей любой)."""
+            parts = list(operand)
+
+            if not parts:
+                return False
+
+            if cls.strip_ns(parts[0].tag) != "mult":
+                return False
+
+            factors = parts[1:]
+
+            has_imag = any(
+                cls.strip_ns(p.tag) == "imag" for p in factors
+            )
+
+            has_deg = any(
+                cls.is_degree_unit(p) for p in factors
+            )
+
+            return has_imag and has_deg
+
+        i_deg_found = False
+        angle_parts = []
+
+        for operand in operands:
+            if operand_is_i_times_deg(operand):
+                if i_deg_found:
+                    return None
+                i_deg_found = True
+                continue
+
+            latex = cls.parse_node_to_latex(operand)
+
+            if latex:
+                angle_parts.append(latex)
+
+        if not i_deg_found or not angle_parts:
+            return None
+
+        if len(angle_parts) == 1:
+            return angle_parts[0]
+
+        return " \\cdot ".join(angle_parts)
 
     @classmethod
     def format_angle_symbol(cls, angle_latex):
         """
         Преобразует угол φ из показателя exp(1i·deg·φ)
-        в запись с символом угла: ∠φ.
-
-        Если числовое значение угла доступно рядом
-        (Mathcad сохраняет результат вычисления),
-        вызывающий код подставит его вместо φ.
+        в запись с символом угла: ∠φ°.
         """
         if not angle_latex:
             return r"\angle"
 
-        return rf"\angle\ {angle_latex}"
+        return rf"\angle\ {angle_latex}^{{\circ}}"
 
     @classmethod
     def parse_complex_node(cls, node):
@@ -756,6 +842,35 @@ class MathcadParser:
                 return f"-{args[0]}" if args else "-"
 
             if op == "pow":
+                # Полярная запись угла Mathcad:
+                #
+                #     e^(1i·deg·φ)  ->  ∠φ°
+                #
+                # Проверяем исходные XML-узлы, а не LaTeX:
+                # основание — константа e, показатель —
+                # произведение 1i·deg и самого угла.
+                base_node = (
+                    children[1]
+                    if len(children) > 1
+                    else None
+                )
+
+                exp_node = (
+                    children[2]
+                    if len(children) > 2
+                    else None
+                )
+
+                if cls.is_euler_base(base_node):
+                    angle_latex = cls.extract_polar_angle_degrees(
+                        exp_node
+                    )
+
+                    if angle_latex is not None:
+                        return cls.format_angle_symbol(
+                            angle_latex
+                        )
+
                 if len(args) > 1:
                     return (
                         f"{{{args[0]}}}"
