@@ -275,17 +275,39 @@ class MathcadParser:
 
         return modulus, angle
 
-    @classmethod
-    def parse_complex(cls, real_value, imag_value):
+    @staticmethod
+    def get_imag_symbol(node):
         """
-        Преобразует a + ib в:
+        Возвращает символ мнимой единицы из XML-узла <imag>.
 
-            |z| angle angle°
+        В Mathcad комплексная единица может быть настроена
+        как i или как j — в XML это атрибут symbol:
+
+            <ml:imag symbol="j">1</ml:imag>
+
+        Если атрибут отсутствует, используется "i"
+        (значение Mathcad по умолчанию).
+        """
+        if node is None:
+            return "i"
+
+        return (node.attrib.get("symbol") or "i").strip() or "i"
+
+    @classmethod
+    def parse_complex(cls, real_value, imag_value, imag_symbol="i"):
+        """
+        Преобразует a + jb в:
+
+            |z| ∠ угол°
 
         Например:
 
-            1 + i  -> 1,414 angle 45°
-            1 - i  -> 1,414 angle -45°
+            1 + j  -> 1,414 ∠45°
+            1 - j  -> 1,414 ∠-45°
+
+        imag_symbol — символ мнимой единицы ("i" или "j"),
+        используемый только в резервной декартовой записи,
+        когда значение не удалось вычислить численно.
         """
         try:
             modulus, angle = cls.calculate_complex_polar(
@@ -310,7 +332,7 @@ class MathcadParser:
                 else "+"
             )
 
-            return f"{real_text}{sign}{imag_text}i"
+            return f"{real_text}{sign}{imag_text}{imag_symbol}"
 
         modulus_text = cls.format_num(
             str(modulus)
@@ -498,9 +520,15 @@ class MathcadParser:
             else "0"
         )
 
+        # Символ мнимой единицы ("i" или "j") берётся из
+        # атрибута <imag symbol="..."> — пользователь мог
+        # настроить в Mathcad комплексную единицу как j.
+        imag_symbol = cls.get_imag_symbol(imag_node)
+
         return cls.parse_complex(
             real_value,
-            imag_value
+            imag_value,
+            imag_symbol
         )
 
     @staticmethod
@@ -795,9 +823,14 @@ class MathcadParser:
                         else "0"
                     )
 
+                    imag_symbol = cls.get_imag_symbol(
+                        second_node
+                    )
+
                     return cls.parse_complex(
                         real_value,
-                        imag_value
+                        imag_value,
+                        imag_symbol
                     )
 
             args = [
