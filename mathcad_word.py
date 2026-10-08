@@ -325,6 +325,60 @@ class MathcadParser:
             rf"{angle_text}^\circ"
         )
 
+    @staticmethod
+    def is_degree_unit(latex):
+        """Проверяет, что узел — единица измерения deg."""
+        return latex.strip() == r"\mathrm{deg}"
+
+    @staticmethod
+    def is_polar_exponent(latex):
+        """
+        Проверяет, что узел — показатель вида 1i·deg·φ
+        (или 1j·deg·φ), то есть запись угла в
+        экспоненциальной форме e^(1i·deg·φ).
+        """
+        text = latex.strip()
+
+        pattern = (
+            r"\\left\(\s*"
+            r"1[ij]\s*\\cdot\s*\\mathrm\{deg\}"
+            r"(?:\s*\\cdot\s*(?P<angle>.+?))?"
+            r"\s*\\right\)"
+        )
+
+        match = re.fullmatch(pattern, text)
+
+        if match:
+            return True, match.group("angle") or ""
+
+        # Вариант без скобок: 1i \cdot \mathrm{deg} · φ
+        pattern_simple = (
+            r"1[ij]\s*\\cdot\s*\\mathrm\{deg\}"
+            r"(?:\s*\\cdot\s*(?P<angle>.+))?"
+        )
+
+        match = re.fullmatch(pattern_simple, text)
+
+        if match:
+            return True, match.group("angle") or ""
+
+        return False, None
+
+    @classmethod
+    def format_angle_symbol(cls, angle_latex):
+        """
+        Преобразует угол φ из показателя exp(1i·deg·φ)
+        в запись с символом угла: ∠φ.
+
+        Если числовое значение угла доступно рядом
+        (Mathcad сохраняет результат вычисления),
+        вызывающий код подставит его вместо φ.
+        """
+        if not angle_latex:
+            return r"\angle"
+
+        return rf"\angle\ {angle_latex}"
+
     @classmethod
     def parse_complex_node(cls, node):
         """Извлекает real и imag из XML-узла complex."""
