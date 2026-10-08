@@ -363,6 +363,171 @@ class MathcadParser:
             imag_value
         )
 
+    @staticmethod
+    def is_complex_latex(latex):
+        """Проверяет, содержит ли LaTeX-строка комплексное число."""
+        return r"\angle" in latex or latex.rstrip().endswith("i")
+
+    MATRIX_MAX_WIDTH = 1000
+
+    @classmethod
+    def build_matrix_latex(cls, rows, cols, delimiter="bmatrix"):
+        r"""
+        Собирает LaTeX-матрицу из уже распознанных ячеек.
+
+        Если матрица широкая (например 5x9), строки разбиваются
+        на несколько блоков pmatrix, чтобы формула помещалась
+        на странице Word и не обрезалась при переносе строк.
+        """
+        if not rows or not cols:
+            return ""
+
+        total_width = sum(
+            max(
+                len(cell)
+                for cell in column
+            )
+            for column in zip(*rows)
+        ) + 2 * (len(cols) - 1)
+
+        # Узкая матрица выводится целиком.
+        if total_width <= cls.MATRIX_MAX_WIDTH:
+            body = r" \\ ".join(
+                " & ".join(row)
+                for row in rows
+            )
+
+            return rf"\begin{{{delimiter}}}{body}\end{{{delimiter}}}"
+
+        # Разбиение по столбцам: подбираем ширину блока так,
+        # чтобы каждая блок-матрица умещалась в заданную ширину.
+        groups = []
+        current_group = []
+        current_width = 0
+
+        for index, width in enumerate(cols):
+            addition = width + (2 if current_group else 0)
+
+            if (
+                current_group
+                and current_width + addition > cls.MATRIX_MAX_WIDTH
+            ):
+                groups.append(current_group)
+                current_group = [index]
+                current_width = width
+            else:
+                current_group.append(index)
+                current_width += addition
+
+        if current_group:
+            groups.append(current_group)
+
+        parts = []
+
+        for group in groups:
+            body = r" \\ ".join(
+                " & ".join(row[index] for index in group)
+                for row in rows
+            )
+
+            parts.append(
+                rf"\begin{{pmatrix}}{body}\end{{pmatrix}}"
+            )
+
+        return r" \quad ".join(parts)
+
+    @classmethod
+    def parse_matrix_node(cls, node, children=None):
+        """
+        Преобразует XML-узел matrix Mathcad в LaTeX-матрицу.
+
+        Ячейки хранятся в потоке flat row-major; количество
+        ячеек равно rows * cols. Пустые узлы <matrix/>
+        (настройки отображения) игнорируются.
+        """
+        if children is None:
+            children = list(node)
+
+        if not children:
+            return ""
+
+        try:
+            rows_count = int(node.attrib.get("rows", 0))
+            cols_count = int(node.attrib.get("cols", 0))
+        except (TypeError, ValueError):
+            rows_count = 0
+            cols_count = 0
+
+        cell_latex_list = [
+            cls.parse_node_to_latex(child) or "0"
+            for child in children
+        ]
+
+        if rows_count <= 0 or cols_count <= 0:
+            rows_count = len(cell_latex_list)
+            cols_count = 1
+
+        # На случай несоответствия атрибутов числу ячеек.
+        needed = rows_count * cols_count
+
+        if len(cell_latex_list) < needed:
+            cell_latex_list.extend(
+                ["0"] * (needed - len(cell_latex_list))
+            )
+        elif len(cell_latex_list) > needed:
+            cols_count = (
+                len(cell_latex_list) + rows_count - 1
+            ) // rows_count
+            needed = rows_count * cols_count
+
+            if len(cell_latex_list) < needed:
+                cell_latex_list.extend(
+                    ["0"] * (needed - len(cell_latex_list))
+                )
+
+        rows = [
+            cell_latex_list[
+                i * cols_count:(i + 1) * cols_count
+            ]
+            for i in range(rows_count)
+        ]
+
+        # Ширина каждой колонки в символах (для разбиения).
+        col_widths = [
+            max(len(cell[i]) for cell in rows)
+            for i in range(cols_count)
+        ]
+
+        # Комплексные числа переводятся в показательную
+        # форму, из-за чего ячейки становятся широкими.
+        # Для таких матриц блоки формируем по одной
+        # колонке за раз.
+        has_complex = any(
+            cls.is_complex_latex(cell)
+            for row in rows
+            for cell in row
+        )
+
+        if has_complex:
+            saved_max_width = cls.MATRIX_MAX_WIDTH
+
+            cls.MATRIX_MAX_WIDTH = min(col_widths)
+
+            try:
+                return cls.build_matrix_latex(
+                    rows,
+                    col_widths,
+                    delimiter="bmatrix"
+                )
+            finally:
+                cls.MATRIX_MAX_WIDTH = saved_max_width
+
+        return cls.build_matrix_latex(
+            rows,
+            col_widths,
+            delimiter="bmatrix"
+        )
+
     @classmethod
     def parse_node_to_latex(cls, node):
         """Рекурсивно преобразует XML-узел Mathcad в LaTeX."""
@@ -432,6 +597,10 @@ class MathcadParser:
             )
 
             return f"{number}{symbol}"
+
+        # Матрицы и векторы Mathcad.
+        if tag == "matrix":
+            return cls.parse_matrix_node(node, children)
 
         if tag == "parens":
             child_latex = (
@@ -564,6 +733,23 @@ class MathcadParser:
                     f"\\overline{{{args[0]}}}"
                     if args
                     else "\\overline{?}"
+                )
+
+            # Индекс элемента матрицы/вектора: A[i, j].
+            if op == "indexer":
+                if not args:
+                    return ""
+
+                index_latex = ", ".join(args[1:])
+
+                return rf"{args[0]}_{{\text[{index_latex}]}}"
+
+            # Транспонирование матрицы: A^T.
+            if op == "transpose":
+                return (
+                    f"{{{args[0]}}}^{{T}}"
+                    if args
+                    else "^{T}"
                 )
 
             if op == "equal":
