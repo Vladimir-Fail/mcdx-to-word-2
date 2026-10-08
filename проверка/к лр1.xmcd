@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<?validation-md5-digest a663d1a8fa3a38dc19e74282c8fb44e2?>
+<?validation-md5-digest 86d84dfa02f78f62799201730e57243f?>
 <worksheet version="3.0.3" xmlns="http://schemas.mathsoft.com/worksheet30" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:ws="http://schemas.mathsoft.com/worksheet30" xmlns:ml="http://schemas.mathsoft.com/math30" xmlns:u="http://schemas.mathsoft.com/units10" xmlns:p="http://schemas.mathsoft.com/provenance10">
 	<pointReleaseData/>
 	<metadata>
@@ -13,9 +13,9 @@
 			<revisedBy>fail_</revisedBy>
 		</userData>
 		<identityInfo>
-			<revision>4</revision>
+			<revision>5</revision>
 			<documentID>BBA80615-A6E4-43D4-A75C-1B90018D49CB</documentID>
-			<versionID>01A8F589-B56E-49F3-B4FD-91BDE7A1E07D</versionID>
+			<versionID>BECCD67D-D037-4717-A5CA-A8A4FA752FE4</versionID>
 			<parentVersionID>00000000-0000-0000-0000-000000000000</parentVersionID>
 			<branchID>00000000-0000-0000-0000-000000000000</branchID>
 		</identityInfo>
@@ -107,7 +107,7 @@
 		</editor>
 		<fileFormat image-type="image/png" image-quality="75" save-numeric-results="true" exclude-large-results="true" save-text-images="false" screen-dpi="96"/>
 		<miscellaneous>
-			<handbook handbook-region-tag-ub="123" can-delete-original-handbook-regions="true" can-delete-user-regions="true" can-print="true" can-copy="true" can-save="true" file-permission-mask="4294967295"/>
+			<handbook handbook-region-tag-ub="125" can-delete-original-handbook-regions="true" can-delete-user-regions="true" can-print="true" can-copy="true" can-save="true" file-permission-mask="4294967295"/>
 		</miscellaneous>
 	</settings>
 	<regions>
@@ -512,6 +512,35 @@
 			</math>
 			<rendering item-idref="14"/>
 		</region>
+		<region region-id="125" left="60" top="447" width="119.25" height="18.75" align-x="72.75" align-y="462" show-border="false" show-highlight="false" is-protected="true" z-order="0" background-color="inherit" tag="">
+			<math optimize="false" disable-calc="false">
+				<ml:define xmlns:ml="http://schemas.mathsoft.com/math30">
+					<ml:id xml:space="preserve">b</ml:id>
+					<ml:eval placeholderMultiplicationStyle="default">
+						<ml:apply>
+							<ml:pow/>
+							<ml:id xml:space="preserve">e</ml:id>
+							<ml:apply>
+								<ml:mult/>
+								<ml:apply>
+									<ml:mult/>
+									<ml:imag symbol="j">1</ml:imag>
+									<ml:id xml:space="preserve">deg</ml:id>
+								</ml:apply>
+								<ml:real>30</ml:real>
+							</ml:apply>
+						</ml:apply>
+						<result xmlns="http://schemas.mathsoft.com/math30">
+							<ml:complex>
+								<ml:real>0.86602540378443871</ml:real>
+								<ml:imag>0.49999999999999994</ml:imag>
+							</ml:complex>
+						</result>
+					</ml:eval>
+				</ml:define>
+			</math>
+			<rendering item-idref="15"/>
+		</region>
 	</regions>
 	<binaryContent>
 		<item item-id="1">iVBORw0KGgoAAAANSUhEUgAAAXYAAAAlCAYAAABWM8KIAAAAAXNSR0IArs4c6QAAAARnQU1B
@@ -867,5 +896,22 @@ X9kSVsxGjrtPHu6n6Ldyfa+iEk/eAdiO4Y0hoqgh+Dxfzx13jesTLIgCqXY7DPAd8WCTcF+R
 9QcC6y+dRoY9NY7yfF2P9EixN22RtJ6i/kYc2vz6xAhj5nst34xKPJqN54eNGa84FedjG8Mb
 i+w+RTDRv5EhxxPIWSdP57/hNPFA97UfleRP+yx8MV08nROJ4uEfs2RTe2OS/AXOBv39gnCQ
 Lp7OieSTp9Pp7GBZ/gDcCijLliGecgAAAABJRU5ErkJggg==</item>
+		<item item-id="15">iVBORw0KGgoAAAANSUhEUgAAAJ8AAAAZCAYAAAAv8vwlAAAAAXNSR0IArs4c6QAAAARnQU1B
+AACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAMESURBVGhD7ZiBkYQgDEW3LguyHgu4
+Omxmi+ESSCBRkehx6u7kzTijCCHAN8nuKzjOTbj4nNtw8Tm34eJzbuNh4nuHaRjC9KbHXY70
+rfOehvB6veBa2HpPYdhqd7rxsZFvHjsIAwQ2koEownGO91rYcxiHCVqc3nxw2u0T+TLzGAY2
+BvdFiEno4tHpxKPEl6LZCLFmBxRGTIc68qWxcOUoheLkfnjt2YW+U3mLUTALEVg+O314WOSD
+FLcnkliH0ft4T+ITUQtFiPcljTYiZK7t0rjU5OK7go8SnxZBEVUUWo5wcKHocuq0pedog6Km
+i+8aHi4+fC7C2RPfuibD90KMEW1PA+84ZXvNdwmflXZjvcfvWVzwrMQCNvBepGITqr+IlpiW
+/dfuv1DEJ2uo22iID8g/LOhizZV2Gi9qOby2hBhTLfdZhrY8vvOeGOxKv9Z+l4iuXa61/wHT
+HuCZpXlLYEhtLT9IfGzg+eIzM09qLfP0hOiF66M9jge7tdZlH3kmdE6rU621/wWLr/hqVPt8
+hOdFvi4pTqTNyBymexeWUOVBilQrvaiDFgKg/rVIaC8xoP9o2GOLr9G/FPXs8xfW4oOIsfzr
+YZs08emPLc7H8/zkRZy2twQ3j2zu/8d3HTGdigXy30KadNCxn6xDSZQjlxdsp9ZexSY+m68E
+naX2tR3IFuID5zny0HNzLbxZOHZ5VQfjGHZOft2fxPF144HKA6wfKEUUYSeJAT4ibBJnU2uv
+YxefzVcGfcaPnKPhYfHpAe0JT8JCF9f+hn0H1gNNdRSJu/LfI4+12dz5UCplznHxYR/KMBta
+2qKD+I5HgDTXM1LheU6s21rzZUGUPigGaVeKb6u9DtjsVvNJsE8v8f2rQNJi8ibBQvcX9i2I
+EkOJTKD2PaWwuDfqfBZ2ttqrGMVn8VWyqk9bfkjxkSDKF9wSntiYM0QHG5HiG8nrFodDbbwN
+MZrR3qgohtGI2tWW1do3sYoPaPkq5l1GydjWEKwQn+Nci4vPuQ0Xn3MbLj7nJkL4BYN+afto
++/v6AAAAAElFTkSuQmCC</item>
 	</binaryContent>
 </worksheet>
