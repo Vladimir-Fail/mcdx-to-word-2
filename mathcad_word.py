@@ -23,6 +23,15 @@ class MathcadParser:
     sig_figs_small = 4
     sig_figs_large = 8
 
+    # Количество знаков после запятой для угла в полярной форме.
+    ANGLE_DECIMALS = 1
+
+    # Режим вывода комплексных чисел:
+    #   True  — переводить a + ib в полярную форму |z|∠φ°;
+    #   False — оставлять в декартовой форме a + ib.
+    # На замену e^(1j·deg·φ) → ∠φ° НЕ влияет.
+    complex_to_polar = True
+
     @staticmethod
     def strip_ns(tag):
         """Удаляет namespace из XML-тега или атрибута."""
@@ -85,6 +94,24 @@ class MathcadParser:
             return str(num_str).replace(".", ",")
 
     @classmethod
+    def format_angle_value(cls, angle):
+        """
+        Форматирует угол в полярной форме: всегда ровно
+        ANGLE_DECIMALS знаков после запятой, разделитель — запятая.
+        """
+        try:
+            value = float(angle)
+        except (ValueError, TypeError):
+            return str(angle).replace(".", ",")
+
+        if math.isclose(value, 0.0, abs_tol=1e-12):
+            value = 0.0
+
+        text = f"{value:.{cls.ANGLE_DECIMALS}f}"
+
+        return text.replace(".", ",")
+
+    @classmethod
     def find_first_by_tag(cls, node, tag):
         """Ищет первый дочерний элемент по имени тега."""
         if node is None:
@@ -133,13 +160,11 @@ class MathcadParser:
         base = (node.text or "").strip()
         subscript = None
 
-        # Индекс может быть записан атрибутом XML.
         for key, value in node.attrib.items():
             if cls.strip_ns(key) == "subscript":
                 subscript = value
                 break
 
-        # Индекс может быть отдельным дочерним узлом.
         for child in node:
             tag = cls.strip_ns(child.tag)
 
@@ -149,8 +174,6 @@ class MathcadParser:
             elif tag in ("name", "id", "sym") and not base:
                 base = "".join(child.itertext()).strip()
 
-        # Основной вариант Mathcad:
-        # имя с точкой является именем с литеральным индексом.
         if subscript is None and "." in base:
             base, subscript = base.split(".", 1)
 
@@ -208,15 +231,7 @@ class MathcadParser:
     def normalize_angle_degrees(angle):
         """
         Нормализует угол в диапазон (-180, 180].
-
-        Возможные значения:
-            180  -> 180
-            -180 -> 180
-            270  -> -90
-            360  -> 0
         """
-        # Сначала убираем возможные ошибки накопления
-        # вычислений около границ диапазона.
         if math.isclose(angle, 0.0, abs_tol=1e-12):
             return 0.0
 
@@ -228,8 +243,6 @@ class MathcadParser:
         elif angle <= -180.0:
             angle += 360.0
 
-        # Повторно убираем очень маленькие значения вроде
-        # -1.4e-14 после вычислений.
         if math.isclose(angle, 0.0, abs_tol=1e-12):
             return 0.0
 
@@ -242,33 +255,14 @@ class MathcadParser:
     def calculate_complex_polar(cls, real_value, imag_value):
         """
         Вычисляет модуль и угол комплексного числа.
-
-        Для z = a + ib:
-
-            |z| = hypot(a, b)
-            angle = atan2(b, a) в градусах
-
-        Результат:
-            модуль, угол
         """
         real_value = float(real_value)
         imag_value = float(imag_value)
 
-        # math.hypot точнее и устойчивее, чем:
-        # sqrt(real_value ** 2 + imag_value ** 2)
-        modulus = math.hypot(
-            real_value,
-            imag_value
-        )
+        modulus = math.hypot(real_value, imag_value)
 
-        # ВАЖНО:
-        # первый аргумент — мнимая часть,
-        # второй аргумент — действительная часть.
         angle = math.degrees(
-            math.atan2(
-                imag_value,
-                real_value
-            )
+            math.atan2(imag_value, real_value)
         )
 
         angle = cls.normalize_angle_degrees(angle)
@@ -279,14 +273,6 @@ class MathcadParser:
     def get_imag_symbol(node):
         """
         Возвращает символ мнимой единицы из XML-узла <imag>.
-
-        В Mathcad комплексная единица может быть настроена
-        как i или как j — в XML это атрибут symbol:
-
-            <ml:imag symbol="j">1</ml:imag>
-
-        Если атрибут отсутствует, используется "i"
-        (значение Mathcad по умолчанию).
         """
         if node is None:
             return "i"
@@ -294,53 +280,67 @@ class MathcadParser:
         return (node.attrib.get("symbol") or "i").strip() or "i"
 
     @classmethod
-    def parse_complex(cls, real_value, imag_value, imag_symbol="i"):
+    def format_complex_cartesian(cls, real_value, imag_value, imag_symbol="i"):
         """
-        Преобразует a + jb в:
-
-            |z| ∠ угол°
-
-        Например:
-
-            1 + j  -> 1,414 ∠45°
-            1 - j  -> 1,414 ∠-45°
-
-        imag_symbol — символ мнимой единицы ("i" или "j"),
-        используемый только в резервной декартовой записи,
-        когда значение не удалось вычислить численно.
+        Возвращает декартову запись комплексного числа:
+        a + bi, a - bi, -bi, a.
         """
         try:
+            real_f = float(real_value)
+            imag_f = float(imag_value)
+        except (ValueError, TypeError):
+            real_text = cls.format_num(str(real_value))
+            imag_text = cls.format_num(str(imag_value))
+            sign = "" if imag_text.startswith("-") else "+"
+            return f"{real_text}{sign}{imag_text}{imag_symbol}"
+
+        real_zero = math.isclose(real_f, 0.0, abs_tol=1e-12)
+        imag_zero = math.isclose(imag_f, 0.0, abs_tol=1e-12)
+
+        real_text = cls.format_num(str(real_f))
+        imag_text = cls.format_num(str(imag_f))
+
+        if imag_zero:
+            return real_text
+
+        if real_zero:
+            if imag_f < 0:
+                return f"-{imag_text.lstrip('-')}{imag_symbol}"
+            return f"{imag_text}{imag_symbol}"
+
+        if imag_f < 0:
+            return f"{real_text} - {imag_text.lstrip('-')}{imag_symbol}"
+
+        return f"{real_text} + {imag_text}{imag_symbol}"
+
+    @classmethod
+    def parse_complex(cls, real_value, imag_value, imag_symbol="i"):
+        """
+        Обрабатывает комплексное число.
+
+        При cls.complex_to_polar == True:
+            a + jb -> |z|∠угол°
+
+        При cls.complex_to_polar == False:
+            a + jb -> a + jb (декартова форма)
+        """
+        if not cls.complex_to_polar:
+            return cls.format_complex_cartesian(
+                real_value, imag_value, imag_symbol
+            )
+
+        try:
             modulus, angle = cls.calculate_complex_polar(
-                real_value,
-                imag_value
+                real_value, imag_value
             )
 
         except (ValueError, TypeError):
-            # Если Mathcad сохранил нечисловой результат,
-            # оставляем исходный декартов вид.
-            real_text = cls.format_num(
-                str(real_value)
+            return cls.format_complex_cartesian(
+                real_value, imag_value, imag_symbol
             )
 
-            imag_text = cls.format_num(
-                str(imag_value)
-            )
-
-            sign = (
-                ""
-                if imag_text.startswith("-")
-                else "+"
-            )
-
-            return f"{real_text}{sign}{imag_text}{imag_symbol}"
-
-        modulus_text = cls.format_num(
-            str(modulus)
-        )
-
-        angle_text = cls.format_num(
-            str(angle)
-        )
+        modulus_text = cls.format_num(str(modulus))
+        angle_text = cls.format_angle_value(angle)
 
         return (
             rf"{modulus_text}"
@@ -350,11 +350,7 @@ class MathcadParser:
 
     @staticmethod
     def is_degree_unit(node):
-        """
-        Проверяет, что XML-узел — единица измерения deg.
-
-        Пример Mathcad: <id>deg</id>
-        """
+        """Проверяет, что XML-узел — единица измерения deg."""
         if node is None:
             return False
 
@@ -365,12 +361,7 @@ class MathcadParser:
 
     @classmethod
     def is_euler_base(cls, node):
-        """
-        Проверяет, что узел — константа e (основание
-        экспоненты).
-
-        Mathcad записывает её как <id>e</id> или <e/>.
-        """
+        """Проверяет, что узел — константа e."""
         if node is None:
             return False
 
@@ -382,7 +373,6 @@ class MathcadParser:
         if tag in ("id", "sym"):
             base = (node.text or "").strip()
 
-            # Имя с индексом — это переменная, а не константа e
             for key in node.attrib:
                 if cls.strip_ns(key) == "subscript":
                     return False
@@ -394,24 +384,7 @@ class MathcadParser:
     @classmethod
     def extract_polar_angle_degrees(cls, node):
         """
-        Пытается распознать показатель степени вида
-        1i·deg·φ (запись угла в градусах в экспоненциальной
-        форме e^(1i·deg·φ)).
-
-        Структура XML Mathcad:
-
-            <apply>
-                <mult/>
-                <apply>
-                    <mult/>
-                    <imag symbol="j">1</imag>   (или 1i / 1j)
-                    <id>deg</id>
-                </apply>
-                <real>120</real>               (сам угол)
-            </apply>
-
-        Возвращает LaTeX-строку угла (число или выражение)
-        либо None, если узел не является полярным показателем.
+        Распознаёт показатель степени вида 1i·deg·φ.
         """
         if node is None:
             return None
@@ -432,7 +405,6 @@ class MathcadParser:
             return None
 
         def operand_is_i_times_deg(operand):
-            """Группа 1i · deg (порядок множителей любой)."""
             parts = list(operand)
 
             if not parts:
@@ -479,13 +451,7 @@ class MathcadParser:
     @classmethod
     def format_angle_symbol(cls, angle_latex):
         r"""
-        Преобразует угол φ из показателя exp(1i·deg·φ)
-        в запись с символом угла: ∠φ°.
-
-        Ведущая единица НЕ добавляется здесь: решение о ней
-        принимает обработчик умножения (есть ли реальный
-        множитель перед углом) или точка входа парсинга для
-        одиночного угла (parse_node_to_latex_root).
+        Преобразует угол φ в запись ∠φ°.
         """
         if not angle_latex:
             return r"\angle^{\circ}"
@@ -525,9 +491,6 @@ class MathcadParser:
             else "0"
         )
 
-        # Символ мнимой единицы ("i" или "j") берётся из
-        # атрибута <imag symbol="..."> — пользователь мог
-        # настроить в Mathcad комплексную единицу как j.
         imag_symbol = cls.get_imag_symbol(imag_node)
 
         return cls.parse_complex(
@@ -538,18 +501,11 @@ class MathcadParser:
 
     ANGLE_MARK_RE = re.compile(r"@@ANGLE\d+@@")
 
-    # Стек словарей меток: каждый распознанный \angle кладёт
-    # свой словарь на вершину; внешний mult забирает все метки
-    # через pop_all_angle_marks().
     _angle_mark_stack = []
 
     @classmethod
     def push_angle_mark(cls, latex):
-        r"""
-        Прячет готовую LaTeX-запись угла (1\angle30^\circ) в
-        защищённую метку @@ANGLEn@@ и возвращает её. Метка будет
-        развернута обратно внешним обработчиком умножения.
-        """
+        r"""Прячет готовую LaTeX-запись угла в метку @@ANGLEn@@."""
         mark = f"@@ANGLE{len(cls._angle_mark_stack)}@@"
         cls._angle_mark_stack.append({mark: latex})
         return mark
@@ -625,39 +581,182 @@ class MathcadParser:
         """Проверяет, содержит ли LaTeX-строка комплексное число."""
         return r"\angle" in latex or latex.rstrip().endswith("i")
 
+    # ------------------------------------------------------------------
+    # Вспомогательные функции для обработки mult
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_bare_angle_mark(text):
+        """Метка угла (возможно с ведущей единицей) без обрамляющих скобок."""
+        stripped = text.strip()
+        if MathcadParser.ANGLE_MARK_RE.fullmatch(stripped):
+            return True
+        if re.fullmatch(r"1?\\angle[^()]*", stripped):
+            return True
+        return False
+
+    @staticmethod
+    def _is_angle_mark_wrapped(text):
+        """Запись угла, возможно обрамлённая скобками."""
+        stripped = text.strip()
+        if MathcadParser.ANGLE_MARK_RE.fullmatch(stripped):
+            return True
+        if re.fullmatch(
+            r"(?:\\left\()?1?\\angle[^)]*(?:\\right\))?",
+            stripped
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _is_pure_number_latex(text):
+        return bool(re.match(r"^[+-]?[\d,.]+$", text.strip()))
+
+    @staticmethod
+    def _is_simple_coefficient(text):
+        """Число или идентификатор без операторов."""
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if re.fullmatch(r"[+-]?[\d,.]+", stripped):
+            return True
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(_\{[^}]*\})?", stripped):
+            return True
+        return False
+
+    @staticmethod
+    def _ends_with_digit(text):
+        """Проверяет, заканчивается ли текст цифрой (с учётом } )."""
+        stripped = text.strip().rstrip("} \t")
+        return bool(stripped) and stripped[-1].isdigit()
+
+    @classmethod
+    def _process_mult_angle_args(cls, args, children):
+        """
+        Обрабатывает множители mult: решает, где поставить "1"
+        перед знаком угла, где объединить с уже имеющейся единицей,
+        а где обойтись без единицы.
+        """
+        n = len(args)
+
+        factors = []
+        for i in range(n):
+            arg = args[i]
+            node = children[1 + i] if 1 + i < len(children) else None
+
+            factors.append({
+                "text": arg,
+                "node": node,
+                "is_angle": cls._is_angle_mark_wrapped(arg),
+                "is_bare_angle": cls._is_bare_angle_mark(arg),
+                "is_unit_one": cls.is_unit_factor(node),
+                "is_pure_number": cls._is_pure_number_latex(arg),
+                "has_one_angle": bool(
+                    re.search(r"(?<!\d)1\\angle", arg)
+                ),
+                "keep": True,
+                "prefix_one": False,
+            })
+
+        # Шаг 1: объединяем явную единицу перед углом.
+        for i, f in enumerate(factors):
+            if not f["is_angle"] or f["has_one_angle"]:
+                continue
+
+            merge_idx = -1
+            for j in range(i - 1, -1, -1):
+                if not factors[j]["text"].strip():
+                    continue
+                if factors[j]["is_unit_one"]:
+                    merge_idx = j
+                break
+
+            if merge_idx != -1:
+                factors[merge_idx]["keep"] = False
+                f["prefix_one"] = True
+
+        # Шаг 2: определяем, где ещё нужна "1".
+        for i, f in enumerate(factors):
+            if not f["is_angle"] or f["has_one_angle"]:
+                continue
+            if f["prefix_one"]:
+                continue
+
+            prev_idx = -1
+            for j in range(i - 1, -1, -1):
+                if not factors[j]["text"].strip():
+                    continue
+                if factors[j]["is_unit_one"]:
+                    continue
+                prev_idx = j
+                break
+
+            if prev_idx == -1:
+                f["prefix_one"] = True
+                continue
+
+            prev_text = factors[prev_idx]["text"].strip()
+
+            if cls._is_pure_number_latex(prev_text):
+                # Обычное число (не 1) → единица не нужна.
+                pass
+            elif cls._is_simple_coefficient(prev_text):
+                # Переменная: если заканчивается цифрой — добавляем "1".
+                if cls._ends_with_digit(prev_text):
+                    f["prefix_one"] = True
+            else:
+                # Выражение (скобки и т.п.) → добавляем "1".
+                f["prefix_one"] = True
+
+        # Шаг 3: собираем результат.
+        parts = []
+        for f in factors:
+            if not f["keep"]:
+                continue
+            text = f["text"]
+            if f["is_angle"] and f["prefix_one"]:
+                text = "1" + text
+            parts.append((text, f))
+
+        result = ""
+        for text, f in parts:
+            if not result:
+                result = text
+                continue
+
+            if cls._is_bare_angle_mark(text):
+                prev_clean = result.strip()
+                if cls._is_simple_coefficient(prev_clean):
+                    result += text
+                else:
+                    result += f" \\cdot {text}"
+            else:
+                result += f" \\cdot {text}"
+
+        return result if result else "1"
+
     MATRIX_MAX_WIDTH = 1000
 
     @classmethod
     def build_matrix_latex(cls, rows, cols, delimiter="bmatrix"):
         r"""
         Собирает LaTeX-матрицу из уже распознанных ячеек.
-
-        Если матрица широкая (например 5x9), строки разбиваются
-        на несколько блоков pmatrix, чтобы формула помещалась
-        на странице Word и не обрезалась при переносе строк.
         """
         if not rows or not cols:
             return ""
 
         total_width = sum(
-            max(
-                len(cell)
-                for cell in column
-            )
+            max(len(cell) for cell in column)
             for column in zip(*rows)
         ) + 2 * (len(cols) - 1)
 
-        # Узкая матрица выводится целиком.
         if total_width <= cls.MATRIX_MAX_WIDTH:
             body = r" \\ ".join(
                 " & ".join(row)
                 for row in rows
             )
-
             return rf"\begin{{{delimiter}}}{body}\end{{{delimiter}}}"
 
-        # Разбиение по столбцам: подбираем ширину блока так,
-        # чтобы каждая блок-матрица умещалась в заданную ширину.
         groups = []
         current_group = []
         current_width = 0
@@ -686,7 +785,6 @@ class MathcadParser:
                 " & ".join(row[index] for index in group)
                 for row in rows
             )
-
             parts.append(
                 rf"\begin{{pmatrix}}{body}\end{{pmatrix}}"
             )
@@ -695,13 +793,7 @@ class MathcadParser:
 
     @classmethod
     def parse_matrix_node(cls, node, children=None):
-        """
-        Преобразует XML-узел matrix Mathcad в LaTeX-матрицу.
-
-        Ячейки хранятся в потоке flat row-major; количество
-        ячеек равно rows * cols. Пустые узлы <matrix/>
-        (настройки отображения) игнорируются.
-        """
+        """Преобразует XML-узел matrix Mathcad в LaTeX-матрицу."""
         if children is None:
             children = list(node)
 
@@ -724,7 +816,6 @@ class MathcadParser:
             rows_count = len(cell_latex_list)
             cols_count = 1
 
-        # На случай несоответствия атрибутов числу ячеек.
         needed = rows_count * cols_count
 
         if len(cell_latex_list) < needed:
@@ -749,16 +840,11 @@ class MathcadParser:
             for i in range(rows_count)
         ]
 
-        # Ширина каждой колонки в символах (для разбиения).
         col_widths = [
             max(len(cell[i]) for cell in rows)
             for i in range(cols_count)
         ]
 
-        # Комплексные числа переводятся в показательную
-        # форму, из-за чего ячейки становятся широкими.
-        # Для таких матриц блоки формируем по одной
-        # колонке за раз.
         has_complex = any(
             cls.is_complex_latex(cell)
             for row in rows
@@ -767,44 +853,30 @@ class MathcadParser:
 
         if has_complex:
             saved_max_width = cls.MATRIX_MAX_WIDTH
-
             cls.MATRIX_MAX_WIDTH = min(col_widths)
-
             try:
                 return cls.build_matrix_latex(
-                    rows,
-                    col_widths,
-                    delimiter="bmatrix"
+                    rows, col_widths, delimiter="bmatrix"
                 )
             finally:
                 cls.MATRIX_MAX_WIDTH = saved_max_width
 
         return cls.build_matrix_latex(
-            rows,
-            col_widths,
-            delimiter="bmatrix"
+            rows, col_widths, delimiter="bmatrix"
         )
 
     @classmethod
     def parse_node_to_latex_root(cls, node):
         """
         Точка входа парсинга узла.
-
-        Разворачивает все защищённые метки @@ANGLEn@@, которые
-        могли остаться неразвёрнутыми (например, одиночный угол
-        без внешнего умножения), и очищает стек меток.
         """
         try:
             latex = cls.parse_node_to_latex(node)
-
         finally:
             marks = cls.pop_all_angle_marks()
 
         if marks:
             for mark, angle_latex in marks.items():
-                # Строка целиком состоит из метки (или
-                # "\angle"+метки) — это одиночная конструкция
-                # e^(1j·deg·φ) без множителя: добавляем единицу.
                 if latex.strip().replace(mark, "") == r"\angle":
                     latex = "1" + angle_latex
                     continue
@@ -814,7 +886,6 @@ class MathcadParser:
                     continue
 
                 bare = rf"\angle{mark}"
-
                 if bare in latex:
                     latex = latex.replace(
                         bare, rf"1{angle_latex}", 1
@@ -822,26 +893,19 @@ class MathcadParser:
 
             latex = cls.restore_angle_symbols(latex, marks)
 
-        # Метка угла может лежать внутри обёрток (parens,
-        # symResult, ...). Разворачиваем её здесь, чтобы
-        # внешние обработчики видели готовую запись.
         if "@@ANGLE" in latex:
             marks = cls.pop_all_angle_marks()
-
             if marks:
                 for mark, angle_latex in marks.items():
                     stripped_latex = latex.strip()
-
                     if (
                         stripped_latex == mark
-                        or stripped_latex.replace(mark, "")
-                        == r"\angle"
+                        or stripped_latex.replace(mark, "") == r"\angle"
                     ):
                         latex = "1" + angle_latex
                         continue
 
                     bare = rf"\angle{mark}"
-
                     if bare in latex:
                         latex = latex.replace(
                             bare, rf"1{angle_latex}", 1
@@ -866,72 +930,50 @@ class MathcadParser:
                 for child in children
             )
 
-        # Обычные числа.
         if tag == "real":
             return cls.format_num(
-                node.text.strip()
-                if node.text
-                else ""
+                node.text.strip() if node.text else ""
             )
 
-        # Имена переменных и функций.
         if tag in ("id", "sym"):
             return cls.parse_identifier(node)
 
-        # Текстовые значения.
         if tag in ("str", "string"):
             return cls.parse_string(node)
 
-        # Комплексное число.
         if tag == "complex":
             return cls.parse_complex_node(node)
 
-        # Результаты вычислений.
         if tag in ("result", "symResult"):
             parts = [
                 cls.parse_node_to_latex(child)
                 for child in children
             ]
-
             parts = [
                 part for part in parts
                 if part and part != "?"
             ]
-
             if parts:
                 return " ".join(parts)
-
             if node.text and node.text.strip():
                 return cls.parse_string(node)
-
             return ""
 
-        # Отдельная мнимая часть.
         if tag == "imag":
-            symbol = node.attrib.get(
-                "symbol",
-                "i"
-            )
-
+            symbol = node.attrib.get("symbol", "i")
             number = cls.format_num(
-                node.text.strip()
-                if node.text
-                else ""
+                node.text.strip() if node.text else ""
             )
-
             return f"{number}{symbol}"
 
-        # Матрицы и векторы Mathcad.
         if tag == "matrix":
             return cls.parse_matrix_node(node, children)
 
         if tag == "parens":
             child_latex = (
                 cls.parse_node_to_latex(children[0])
-                if children
-                else ""
+                if children else ""
             )
-
             return rf"\left({child_latex}\right)"
 
         if tag == "apply":
@@ -941,51 +983,51 @@ class MathcadParser:
             op_node = children[0]
             op = cls.strip_ns(op_node.tag)
 
-            # Частый вариант Mathcad 15:
-            #
-            # <apply>
-            #     <plus />
-            #     <real>a</real>
-            #     <imag>b</imag>
-            # </apply>
-            #
-            # Это означает a + ib.
+            # ---- a + ib ----
             if op == "plus" and len(children) >= 3:
                 first_node = children[1]
                 second_node = children[2]
+                first_tag = cls.strip_ns(first_node.tag)
+                second_tag = cls.strip_ns(second_node.tag)
 
-                first_tag = cls.strip_ns(
-                    first_node.tag
-                )
-
-                second_tag = cls.strip_ns(
-                    second_node.tag
-                )
-
-                if (
-                    first_tag == "real"
-                    and second_tag == "imag"
-                ):
+                if first_tag == "real" and second_tag == "imag":
                     real_value = (
                         first_node.text.strip()
-                        if first_node.text
-                        else "0"
+                        if first_node.text else "0"
                     )
-
                     imag_value = (
                         second_node.text.strip()
-                        if second_node.text
-                        else "0"
+                        if second_node.text else "0"
                     )
-
-                    imag_symbol = cls.get_imag_symbol(
-                        second_node
-                    )
-
+                    imag_symbol = cls.get_imag_symbol(second_node)
                     return cls.parse_complex(
-                        real_value,
-                        imag_value,
-                        imag_symbol
+                        real_value, imag_value, imag_symbol
+                    )
+
+            # ---- a - ib ----
+            if op == "minus" and len(children) >= 3:
+                first_node = children[1]
+                second_node = children[2]
+                first_tag = cls.strip_ns(first_node.tag)
+                second_tag = cls.strip_ns(second_node.tag)
+
+                if first_tag == "real" and second_tag == "imag":
+                    real_value = (
+                        first_node.text.strip()
+                        if first_node.text else "0"
+                    )
+                    imag_value_raw = (
+                        second_node.text.strip()
+                        if second_node.text else "0"
+                    )
+                    try:
+                        imag_value = str(-float(imag_value_raw))
+                    except (ValueError, TypeError):
+                        imag_value = f"-({imag_value_raw})"
+
+                    imag_symbol = cls.get_imag_symbol(second_node)
+                    return cls.parse_complex(
+                        real_value, imag_value, imag_symbol
                     )
 
             args = [
@@ -994,116 +1036,13 @@ class MathcadParser:
             ]
 
             if op == "mult":
-                def is_angle_mark(text):
-                    """Узел — готовая запись угла (возможно, в скобках)."""
-                    return bool(
-                        cls.ANGLE_MARK_RE.fullmatch(text.strip())
-                        or re.fullmatch(
-                            r"(?:\\left\()?1?\\angle[^)]*(?:\\right\))?",
-                            text.strip()
-                        )
-                    )
-
-                def has_real_operand_before(idx):
-                    """
-                    Есть ли перед меткой угла значимый множитель
-                    (число, переменная, функция, скобка), который
-                    доживает до результата. Только в этом случае
-                    угол пишется без ведущей единицы.
-                    Нули и единицы (будут убраны/заменены) — не
-                    считаются.
-                    """
-                    for j in range(1, idx):
-                        arg_text = (args[j] or "").strip()
-
-                        if not arg_text:
-                            continue
-
-                        if cls.is_unit_factor(children[1 + j]):
-                            continue
-
-                        if re.match(r"^[+-]?[\d,.]+$", arg_text):
-                            try:
-                                value = float(
-                                    arg_text.replace(",", ".")
-                                )
-                            except ValueError:
-                                value = None
-
-                            if value in (None, 0.0):
-                                continue
-
-                        return True
-
-                    return False
-
-                # Меткам углов без реального множителя слева
-                # дописываем единицу: I2·0·e^(1j·deg·30) или
-                # голый e^(1j·deg·30) -> 1\angle30^\circ.
-                for idx, arg in enumerate(args):
-                    if (
-                        is_angle_mark(arg)
-                        and "1\\angle" not in arg
-                        and not has_real_operand_before(idx)
-                    ):
-                        args[idx] = "1" + arg
-
-                # 1) Явная единица перед знаком угла оставляем:
-                #    1·e^(1j·deg·30) -> 1\angle30^\circ
-                if (
-                    len(args) > 1
-                    and is_angle_mark(args[1])
-                    and cls.is_unit_factor(children[1])
-                ):
-                    angle_marks = cls.pop_all_angle_marks()
-
-                    return cls.restore_angle_symbols(
-                        f"1 {args[1]}", angle_marks
-                    ).replace(" ", "", 0)
-
-                # 2) Убираем "съеденные" единицы перед углом,
-                #    если они оказались бы лишними.
-                cleaned = []
-
-                for idx, arg in enumerate(args):
-                    operand_node = (
-                        children[1 + idx]
-                        if 1 + idx < len(children)
-                        else None
-                    )
-
-                    if (
-                        is_angle_mark(arg)
-                        and not arg.strip().startswith("1")
-                        and cls.is_unit_factor(operand_node)
-                    ):
-                        continue
-
-                    cleaned.append(arg)
-
-                if not cleaned:
-                    cleaned = ["1"]
-
-                marks_to_restore = {}
-
-                # 3) Собираем произведение: между обычными
-                #    множителями ставим \cdot; рядом с меткой
-                #    угла — без разделителя и без пробела.
-                result = cleaned[0]
-
-                for arg in cleaned[1:]:
-                    if is_angle_mark(result) or is_angle_mark(arg):
-                        result += arg
-                    else:
-                        result += f" \\cdot {arg}"
-
+                result = cls._process_mult_angle_args(
+                    args, children
+                )
                 marks_to_restore = cls.pop_all_angle_marks()
-
-                restored = cls.restore_angle_symbols(
+                return cls.restore_angle_symbols(
                     result, marks_to_restore
                 )
-
-                return restored
 
             if op == "div":
                 if len(args) > 1:
@@ -1111,130 +1050,87 @@ class MathcadParser:
                         f"\\frac{{{args[0]}}}"
                         f"{{{args[1]}}}"
                     )
-
                 return (
                     f"\\frac{{{args[0]}}}{{?}}"
-                    if args
-                    else ""
+                    if args else ""
                 )
 
             if op == "plus":
                 if len(args) > 1:
                     return f"{args[0]} + {args[1]}"
-
                 return args[0] if args else ""
 
             if op == "minus":
                 if len(args) > 1:
                     return f"{args[0]} - {args[1]}"
-
                 return f"-{args[0]}" if args else "-"
 
             if op == "neg":
                 return f"-{args[0]}" if args else "-"
 
             if op == "pow":
-                # Полярная запись угла Mathcad:
-                #
-                #     e^(1i·deg·φ)  ->  ∠φ°
-                #
-                # Проверяем исходные XML-узлы, а не LaTeX:
-                # основание — константа e, показатель —
-                # произведение 1i·deg и самого угла.
                 base_node = (
-                    children[1]
-                    if len(children) > 1
-                    else None
+                    children[1] if len(children) > 1 else None
                 )
-
                 exp_node = (
-                    children[2]
-                    if len(children) > 2
-                    else None
+                    children[2] if len(children) > 2 else None
                 )
 
                 if cls.is_euler_base(base_node):
                     angle_latex = cls.extract_polar_angle_degrees(
                         exp_node
                     )
-
                     if angle_latex is not None:
-                        # Готовая запись вида 1\angle30^\circ или
-                        # \angle30^\circ прячется в метку, чтобы
-                        # внешнее умножение не вставило \cdot.
                         return cls.push_angle_mark(
                             cls.format_angle_symbol(angle_latex)
                         )
 
                 if len(args) > 1:
-                    return (
-                        f"{{{args[0]}}}"
-                        f"^{{{args[1]}}}"
-                    )
-
+                    return f"{{{args[0]}}}^{{{args[1]}}}"
                 return (
                     f"{{{args[0]}}}^{{?}}"
-                    if args
-                    else ""
+                    if args else ""
                 )
 
             if op == "sqrt":
                 return (
                     f"\\sqrt{{{args[0]}}}"
-                    if args
-                    else "\\sqrt{?}"
+                    if args else "\\sqrt{?}"
                 )
 
             if op == "absval":
                 return (
                     f"\\left| {args[0]} \\right|"
-                    if args
-                    else "\\left| ? \\right|"
+                    if args else "\\left| ? \\right|"
                 )
 
             if op == "conjugate":
                 return (
                     f"\\overline{{{args[0]}}}"
-                    if args
-                    else "\\overline{?}"
+                    if args else "\\overline{?}"
                 )
 
-            # Индекс элемента матрицы/вектора: A[i, j].
             if op == "indexer":
                 if not args:
                     return ""
-
                 index_latex = ", ".join(args[1:])
-
                 return rf"{args[0]}_{{\text[{index_latex}]}}"
 
-            # Транспонирование матрицы: A^T.
             if op == "transpose":
                 return (
                     f"{{{args[0]}}}^{{T}}"
-                    if args
-                    else "^{T}"
+                    if args else "^{T}"
                 )
 
             if op == "equal":
                 if len(args) > 1:
-                    return (
-                        f"{args[0]} = {args[1]}"
-                    )
+                    return f"{args[0]} = {args[1]}"
+                return f"{args[0]} = ?" if args else "="
 
-                return (
-                    f"{args[0]} = ?"
-                    if args
-                    else "="
-                )
-
-            # Вызов функции.
             if op in ("id", "sym"):
                 function_name = cls.parse_identifier(
-                    op_node,
-                    function=True
+                    op_node, function=True
                 )
-
                 return (
                     rf"{function_name}\left("
                     + ", ".join(args)
@@ -1247,39 +1143,30 @@ class MathcadParser:
             bound_vars = next(
                 (
                     child for child in children
-                    if cls.strip_ns(child.tag)
-                    == "boundVars"
+                    if cls.strip_ns(child.tag) == "boundVars"
                 ),
                 None
             )
-
             function_node = next(
                 (
                     child for child in children
-                    if cls.strip_ns(child.tag)
-                    in ("id", "sym")
+                    if cls.strip_ns(child.tag) in ("id", "sym")
                 ),
                 None
             )
-
             function_latex = (
                 cls.parse_identifier(
-                    function_node,
-                    function=True
+                    function_node, function=True
                 )
-                if function_node is not None
-                else ""
+                if function_node is not None else ""
             )
-
             variables_latex = (
                 ", ".join(
                     cls.parse_node_to_latex(child)
                     for child in bound_vars
                 )
-                if bound_vars is not None
-                else ""
+                if bound_vars is not None else ""
             )
-
             return (
                 rf"{function_latex}\left("
                 + variables_latex
@@ -1295,13 +1182,9 @@ class MathcadParser:
         if tag == "placeholder":
             return r"\square"
 
-        # Обёртки provenance, unitedValue и т. п.
         if children:
             for child in children:
-                result = cls.parse_node_to_latex(
-                    child
-                )
-
+                result = cls.parse_node_to_latex(child)
                 if result and result != "?":
                     return result
 
@@ -1309,22 +1192,19 @@ class MathcadParser:
 
     @classmethod
     def parse_eval_to_latex_root(cls, node):
-        """Точка входа для eval-регионов (см. parse_node_to_latex_root)."""
+        """Точка входа для eval-регионов."""
         try:
             latex = cls.parse_eval_to_latex(node)
-
         finally:
             marks = cls.pop_all_angle_marks()
 
         if marks:
             for mark, angle_latex in marks.items():
                 bare = rf"\angle{mark}"
-
                 if bare in latex:
                     latex = latex.replace(
                         bare, rf"1{angle_latex}", 1
                     )
-
             latex = cls.restore_angle_symbols(latex, marks)
 
         return latex
@@ -1333,20 +1213,10 @@ class MathcadParser:
     def parse_eval_to_latex(cls, node):
         """
         Обрабатывает eval.
-
-        Возможный результат:
-
-            выражение = символьный результат = итог
+        Возможный результат: выражение = символьный результат = итог
         """
-        result_node = cls.find_first_by_tag(
-            node,
-            "result"
-        )
-
-        sym_eval_node = cls.find_first_by_tag(
-            node,
-            "symEval"
-        )
+        result_node = cls.find_first_by_tag(node, "result")
+        sym_eval_node = cls.find_first_by_tag(node, "symEval")
 
         parts = []
 
@@ -1359,29 +1229,21 @@ class MathcadParser:
                 ),
                 None
             )
-
             sym_result_node = cls.find_first_by_tag(
-                sym_eval_node,
-                "symResult"
+                sym_eval_node, "symResult"
             )
 
             if expression_node is not None:
-                expression_latex = (
-                    cls.parse_node_to_latex(
-                        expression_node
-                    )
+                expression_latex = cls.parse_node_to_latex(
+                    expression_node
                 )
-
                 if expression_latex:
                     parts.append(expression_latex)
 
             if sym_result_node is not None:
-                sym_result_latex = (
-                    cls.parse_node_to_latex(
-                        sym_result_node
-                    )
+                sym_result_latex = cls.parse_node_to_latex(
+                    sym_result_node
                 )
-
                 if sym_result_latex:
                     parts.append(sym_result_latex)
 
@@ -1389,29 +1251,19 @@ class MathcadParser:
             expression_node = next(
                 (
                     child for child in node
-                    if cls.strip_ns(child.tag)
-                    != "result"
+                    if cls.strip_ns(child.tag) != "result"
                 ),
                 None
             )
-
             if expression_node is not None:
-                expression_latex = (
-                    cls.parse_node_to_latex(
-                        expression_node
-                    )
+                expression_latex = cls.parse_node_to_latex(
+                    expression_node
                 )
-
                 if expression_latex:
                     parts.append(expression_latex)
 
         if result_node is not None:
-            result_latex = (
-                cls.parse_node_to_latex(
-                    result_node
-                )
-            )
-
+            result_latex = cls.parse_node_to_latex(result_node)
             if result_latex:
                 parts.append(result_latex)
 
@@ -1423,7 +1275,6 @@ class MathcadParser:
         try:
             tree = ET.parse(filepath)
             root = tree.getroot()
-
         except Exception as exc:
             raise ValueError(
                 f"Ошибка чтения XML/XMCD файла: {exc}"
@@ -1432,15 +1283,12 @@ class MathcadParser:
         regions = [
             element
             for element in root.iter()
-            if cls.strip_ns(element.tag)
-            == "region"
+            if cls.strip_ns(element.tag) == "region"
         ]
 
         def get_top(region):
             try:
-                return float(
-                    region.attrib.get("top", 0)
-                )
+                return float(region.attrib.get("top", 0))
             except (TypeError, ValueError):
                 return 0.0
 
@@ -1449,53 +1297,27 @@ class MathcadParser:
         content = []
 
         for region in regions:
-            # Текстовые регионы.
-            text_node = cls.find_first_by_tag(
-                region,
-                "text"
-            )
-
+            text_node = cls.find_first_by_tag(region, "text")
             if text_node is not None:
                 text_values = []
-
                 for paragraph in text_node.iter():
-                    if cls.strip_ns(
-                        paragraph.tag
-                    ) == "p":
+                    if cls.strip_ns(paragraph.tag) == "p":
                         paragraph_text = (
-                            "".join(
-                                paragraph.itertext()
-                            ).strip()
+                            "".join(paragraph.itertext()).strip()
                         )
-
                         if paragraph_text:
-                            text_values.append(
-                                paragraph_text
-                            )
+                            text_values.append(paragraph_text)
 
                 if text_values:
-                    content.append(
-                        "\n".join(text_values)
-                        + "\n\n"
-                    )
+                    content.append("\n".join(text_values) + "\n\n")
                 else:
                     text_value = (
-                        "".join(
-                            text_node.itertext()
-                        ).strip()
+                        "".join(text_node.itertext()).strip()
                     )
-
                     if text_value:
-                        content.append(
-                            f"{text_value}\n\n"
-                        )
+                        content.append(f"{text_value}\n\n")
 
-            # Математические регионы.
-            math_node = cls.find_first_by_tag(
-                region,
-                "math"
-            )
-
+            math_node = cls.find_first_by_tag(region, "math")
             if math_node is None:
                 continue
 
@@ -1505,51 +1327,31 @@ class MathcadParser:
 
                 if tag == "define":
                     if len(child) >= 2:
-                        left_side = (
-                            cls.parse_node_to_latex(
-                                child[0]
-                            )
-                        )
-
+                        left_side = cls.parse_node_to_latex(child[0])
                         right_side = child[1]
 
-                        if cls.strip_ns(
-                            right_side.tag
-                        ) == "eval":
+                        if cls.strip_ns(right_side.tag) == "eval":
                             right_latex = (
-                                cls.parse_eval_to_latex_root(
-                                    right_side
-                                )
+                                cls.parse_eval_to_latex_root(right_side)
                             )
                         else:
                             right_latex = (
-                                cls.parse_node_to_latex_root(
-                                    right_side
-                                )
+                                cls.parse_node_to_latex_root(right_side)
                             )
 
                         if right_latex:
-                            latex = (
-                                f"{left_side} = "
-                                f"{right_latex}"
-                            )
+                            latex = f"{left_side} = {right_latex}"
                         else:
                             latex = left_side
 
                 elif tag == "eval":
-                    latex = cls.parse_eval_to_latex_root(
-                        child
-                    )
+                    latex = cls.parse_eval_to_latex_root(child)
 
                 else:
-                    latex = cls.parse_node_to_latex_root(
-                        child
-                    )
+                    latex = cls.parse_node_to_latex_root(child)
 
                 if latex:
-                    content.append(
-                        f"$$ {latex} $$\n\n"
-                    )
+                    content.append(f"$$ {latex} $$\n\n")
 
         return "".join(content)
 
@@ -1562,41 +1364,28 @@ class WordConverter:
         """Проверяет наличие Pandoc."""
         try:
             version = pypandoc.get_pandoc_version()
-
-            log_callback(
-                f"[OK] Обнаружен Pandoc версии: {version}"
-            )
-
+            log_callback(f"[OK] Обнаружен Pandoc версии: {version}")
             return True
-
         except OSError:
             log_callback(
                 "[INFO] Pandoc не найден. "
                 "Начинаю автоматическую загрузку..."
             )
-
             try:
                 pypandoc.download_pandoc()
-
                 log_callback(
                     "[OK] Pandoc успешно скачан и установлен!"
                 )
-
                 return True
-
             except Exception as exc:
                 log_callback(
                     f"[ERROR] Не удалось скачать Pandoc: {exc}"
                 )
-
                 return False
 
     @staticmethod
     def convert_to_word(
-        markdown_text,
-        output_file,
-        template_file,
-        log_callback
+        markdown_text, output_file, template_file, log_callback
     ):
         """Конвертирует Markdown с формулами в DOCX."""
         try:
@@ -1607,13 +1396,10 @@ class WordConverter:
 
             extra_args = []
 
-            if template_file and os.path.exists(
-                template_file
-            ):
+            if template_file and os.path.exists(template_file):
                 extra_args.append(
                     f"--reference-doc={template_file}"
                 )
-
                 log_callback(
                     "[INFO] Применяется шаблон: "
                     f"{os.path.basename(template_file)}"
@@ -1632,374 +1418,233 @@ class WordConverter:
                 extra_args=extra_args
             )
 
-            log_callback(
-                "[OK] Успех! Документ сохранен."
-            )
-
+            log_callback("[OK] Успех! Документ сохранен.")
             return True
 
         except Exception as exc:
-            log_callback(
-                f"[ERROR] Ошибка конвертации: {exc}"
-            )
-
+            log_callback(f"[ERROR] Ошибка конвертации: {exc}")
             return False
 
 
 class ConverterApp:
     def __init__(self, root):
         self.root = root
-
-        self.root.title(
-            "Mathcad to Word Converter (со стилями)"
-        )
-        self.root.geometry("600x670")
-        self.root.configure(
-            padx=20,
-            pady=20
-        )
+        self.root.title("Mathcad to Word Converter (со стилями)")
+        self.root.geometry("620x720")
+        self.root.configure(padx=20, pady=20)
 
         self.input_file = None
-        self.template_file = (
-            self.find_default_template()
-        )
+        self.template_file = self.find_default_template()
 
         self.setup_ui()
 
         if DND_SUPPORTED:
-            self.root.drop_target_register(
-                DND_FILES
-            )
-
-            self.root.dnd_bind(
-                "<<Drop>>",
-                self.on_drop
-            )
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<Drop>>", self.on_drop)
 
     def find_default_template(self):
         """Ищет DOCX-шаблон рядом со скриптом."""
         if getattr(sys, "frozen", False):
-            base_dir = os.path.dirname(
-                sys.executable
-            )
+            base_dir = os.path.dirname(sys.executable)
         else:
-            base_dir = os.path.dirname(
-                os.path.abspath(__file__)
-            )
+            base_dir = os.path.dirname(os.path.abspath(__file__))
 
-        template_dir = os.path.join(
-            base_dir,
-            "шаблон"
-        )
-
+        template_dir = os.path.join(base_dir, "шаблон")
         expected_template = os.path.join(
-            template_dir,
-            "Шаблон стилей.docx"
+            template_dir, "Шаблон стилей.docx"
         )
 
         if os.path.exists(expected_template):
             return expected_template
 
         if os.path.isdir(template_dir):
-            for filename in os.listdir(
-                template_dir
-            ):
+            for filename in os.listdir(template_dir):
                 if filename.lower().endswith(".docx"):
-                    return os.path.join(
-                        template_dir,
-                        filename
-                    )
+                    return os.path.join(template_dir, filename)
 
-        fallback_dir = (
-            r"C:\VS code здесь\mcdx to word\шаблон"
-        )
-
+        fallback_dir = r"C:\VS code здесь\mcdx to word\шаблон"
         if os.path.isdir(fallback_dir):
-            for filename in os.listdir(
-                fallback_dir
-            ):
+            for filename in os.listdir(fallback_dir):
                 if filename.lower().endswith(".docx"):
-                    return os.path.join(
-                        fallback_dir,
-                        filename
-                    )
+                    return os.path.join(fallback_dir, filename)
 
         return ""
 
     def setup_ui(self):
-        # Исходный файл.
         frame_input = ttk.LabelFrame(
             self.root,
             text="Исходный файл Mathcad (.xmcd, .xml)",
             padding=10
         )
-
-        frame_input.pack(
-            fill=tk.X,
-            pady=(0, 15)
-        )
+        frame_input.pack(fill=tk.X, pady=(0, 15))
 
         self.lbl_input = ttk.Label(
             frame_input,
             text="Файл не выбран",
             foreground="gray"
         )
-
-        self.lbl_input.pack(
-            side=tk.LEFT,
-            fill=tk.X,
-            expand=True
-        )
+        self.lbl_input.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         ttk.Button(
-            frame_input,
-            text="Выбрать файл",
+            frame_input, text="Выбрать файл",
             command=self.browse_input
-        ).pack(
-            side=tk.RIGHT,
-            padx=5
-        )
+        ).pack(side=tk.RIGHT, padx=5)
 
         if DND_SUPPORTED:
             ttk.Label(
                 frame_input,
                 text="(Или перетащите файл сюда)",
                 font=("Segoe UI", 8, "italic")
-            ).pack(
-                side=tk.BOTTOM,
-                pady=5
-            )
+            ).pack(side=tk.BOTTOM, pady=5)
 
-        # Настройки округления.
+        # ---------- Настройки ----------
         frame_settings = ttk.LabelFrame(
             self.root,
-            text="Настройки округления (значащие цифры)",
+            text="Настройки вывода",
             padding=10
         )
+        frame_settings.pack(fill=tk.X, pady=(0, 15))
 
-        frame_settings.pack(
-            fill=tk.X,
-            pady=(0, 15)
-        )
+        self.sig_figs_small_var = tk.IntVar(value=4)
+        self.sig_figs_large_var = tk.IntVar(value=8)
 
-        self.sig_figs_small_var = tk.IntVar(
-            value=4
-        )
+        ttk.Label(
+            frame_settings,
+            text="Малые числа и дроби (значащих цифр):"
+        ).grid(row=0, column=0, sticky=tk.W, pady=2)
 
-        self.sig_figs_large_var = tk.IntVar(
-            value=8
-        )
+        ttk.Spinbox(
+            frame_settings, from_=1, to=15,
+            textvariable=self.sig_figs_small_var, width=5
+        ).grid(row=0, column=1, sticky=tk.W, padx=10, pady=2)
+
+        ttk.Label(
+            frame_settings,
+            text="Большие числа (значащих цифр):"
+        ).grid(row=1, column=0, sticky=tk.W, pady=2)
+
+        ttk.Spinbox(
+            frame_settings, from_=1, to=20,
+            textvariable=self.sig_figs_large_var, width=5
+        ).grid(row=1, column=1, sticky=tk.W, padx=10, pady=2)
+
+        ttk.Separator(
+            frame_settings, orient=tk.HORIZONTAL
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=8)
+
+        # Выбор формы комплексных чисел.
+        ttk.Label(
+            frame_settings,
+            text="Форма комплексных чисел:"
+        ).grid(row=3, column=0, sticky=tk.W, pady=(0, 4))
+
+        self.complex_form_var = tk.StringVar(value="polar")
+
+        ttk.Radiobutton(
+            frame_settings,
+            text="Полярная ( |z|∠φ° )",
+            variable=self.complex_form_var,
+            value="polar"
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=1)
+
+        ttk.Radiobutton(
+            frame_settings,
+            text="Декартова ( a + ib )",
+            variable=self.complex_form_var,
+            value="cartesian"
+        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=1)
 
         ttk.Label(
             frame_settings,
             text=(
-                "Для малых чисел и дробей "
-                "(по умолчанию 4):"
-            )
-        ).grid(
-            row=0,
-            column=0,
-            sticky=tk.W,
-            pady=2
-        )
+                "Не влияет на замену e^(1j·deg·φ) → ∠φ°"
+            ),
+            font=("Segoe UI", 8, "italic"),
+            foreground="gray"
+        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
 
-        ttk.Spinbox(
-            frame_settings,
-            from_=1,
-            to=15,
-            textvariable=self.sig_figs_small_var,
-            width=5
-        ).grid(
-            row=0,
-            column=1,
-            sticky=tk.W,
-            padx=10,
-            pady=2
-        )
-
-        ttk.Label(
-            frame_settings,
-            text=(
-                "Для больших чисел "
-                "(по умолчанию 8):"
-            )
-        ).grid(
-            row=1,
-            column=0,
-            sticky=tk.W,
-            pady=2
-        )
-
-        ttk.Spinbox(
-            frame_settings,
-            from_=1,
-            to=20,
-            textvariable=self.sig_figs_large_var,
-            width=5
-        ).grid(
-            row=1,
-            column=1,
-            sticky=tk.W,
-            padx=10,
-            pady=2
-        )
-
-        # Шаблон Word.
+        # ---------- Шаблон ----------
         frame_template = ttk.LabelFrame(
             self.root,
             text="Шаблон стилей Word (.docx)",
             padding=10
         )
-
-        frame_template.pack(
-            fill=tk.X,
-            pady=(0, 15)
-        )
+        frame_template.pack(fill=tk.X, pady=(0, 15))
 
         self.lbl_template = ttk.Label(
             frame_template,
-            text=(
-                self.template_file
-                or "Шаблон не найден"
-            ),
-            foreground=(
-                "black"
-                if self.template_file
-                else "red"
-            )
+            text=(self.template_file or "Шаблон не найден"),
+            foreground="black" if self.template_file else "red"
         )
-
-        self.lbl_template.pack(
-            side=tk.LEFT,
-            fill=tk.X,
-            expand=True
-        )
+        self.lbl_template.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         ttk.Button(
-            frame_template,
-            text="Изменить",
+            frame_template, text="Изменить",
             command=self.browse_template
-        ).pack(
-            side=tk.RIGHT,
-            padx=5
-        )
+        ).pack(side=tk.RIGHT, padx=5)
 
-        # Кнопка конвертации.
+        # ---------- Кнопка ----------
         self.btn_convert = ttk.Button(
             self.root,
             text="Конвертировать и сохранить как...",
             command=self.process_and_save,
             state=tk.DISABLED
         )
+        self.btn_convert.pack(fill=tk.X, pady=10, ipady=5)
 
-        self.btn_convert.pack(
-            fill=tk.X,
-            pady=10,
-            ipady=5
-        )
-
-        # Окно лога.
+        # ---------- Лог ----------
         frame_log = ttk.LabelFrame(
-            self.root,
-            text="Статус и Логи",
-            padding=5
+            self.root, text="Статус и Логи", padding=5
         )
-
-        frame_log.pack(
-            fill=tk.BOTH,
-            expand=True
-        )
+        frame_log.pack(fill=tk.BOTH, expand=True)
 
         self.log_text = tk.Text(
-            frame_log,
-            height=10,
-            state=tk.DISABLED,
-            bg="#f4f4f9",
-            font=("Consolas", 9)
+            frame_log, height=10, state=tk.DISABLED,
+            bg="#f4f4f9", font=("Consolas", 9)
         )
-
-        self.log_text.pack(
-            fill=tk.BOTH,
-            expand=True
-        )
+        self.log_text.pack(fill=tk.BOTH, expand=True)
 
         self.log("Проверка окружения...")
-
         self.root.after(
             500,
-            lambda: WordConverter.check_pandoc(
-                self.log
-            )
+            lambda: WordConverter.check_pandoc(self.log)
         )
 
     def log(self, message):
         """Добавляет сообщение в лог."""
-        self.log_text.config(
-            state=tk.NORMAL
-        )
-
-        self.log_text.insert(
-            tk.END,
-            message + "\n"
-        )
-
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
-
-        self.log_text.config(
-            state=tk.DISABLED
-        )
-
+        self.log_text.config(state=tk.DISABLED)
         self.root.update()
 
     def browse_input(self):
         filepath = filedialog.askopenfilename(
             title="Выберите файл Mathcad",
             filetypes=[
-                (
-                    "Mathcad XML",
-                    "*.xmcd *.xml"
-                ),
-                (
-                    "All files",
-                    "*.*"
-                )
+                ("Mathcad XML", "*.xmcd *.xml"),
+                ("All files", "*.*")
             ]
         )
-
         if filepath:
             self.set_input_file(filepath)
 
     def on_drop(self, event):
         """Обрабатывает перетаскивание файла."""
         filepath = event.data
-
-        if (
-            filepath.startswith("{")
-            and filepath.endswith("}")
-        ):
+        if filepath.startswith("{") and filepath.endswith("}"):
             filepath = filepath[1:-1]
-
         self.set_input_file(filepath)
 
     def set_input_file(self, filepath):
-        if filepath.lower().endswith(
-            (".xmcd", ".xml")
-        ):
+        if filepath.lower().endswith((".xmcd", ".xml")):
             self.input_file = filepath
-
             self.lbl_input.config(
                 text=os.path.basename(filepath),
                 foreground="black"
             )
-
-            self.btn_convert.config(
-                state=tk.NORMAL
-            )
-
-            self.log(
-                f"[INFO] Выбран файл: {filepath}"
-            )
-
+            self.btn_convert.config(state=tk.NORMAL)
+            self.log(f"[INFO] Выбран файл: {filepath}")
         else:
             messagebox.showwarning(
                 "Неверный формат",
@@ -2009,25 +1654,15 @@ class ConverterApp:
     def browse_template(self):
         filepath = filedialog.askopenfilename(
             title="Выберите шаблон стилей Word",
-            filetypes=[
-                (
-                    "Word Documents",
-                    "*.docx"
-                )
-            ]
+            filetypes=[("Word Documents", "*.docx")]
         )
-
         if filepath:
             self.template_file = filepath
-
             self.lbl_template.config(
                 text=os.path.basename(filepath),
                 foreground="black"
             )
-
-            self.log(
-                f"[INFO] Шаблон изменен на: {filepath}"
-            )
+            self.log(f"[INFO] Шаблон изменен на: {filepath}")
 
     def process_and_save(self):
         if not self.input_file:
@@ -2037,14 +1672,8 @@ class ConverterApp:
             title="Сохранить результат как...",
             defaultextension=".docx",
             initialfile="Результат_Mathcad.docx",
-            filetypes=[
-                (
-                    "Word Document",
-                    "*.docx"
-                )
-            ]
+            filetypes=[("Word Document", "*.docx")]
         )
-
         if not output_file:
             return
 
@@ -2052,7 +1681,6 @@ class ConverterApp:
             try:
                 with open(output_file, "a"):
                     pass
-
             except PermissionError:
                 messagebox.showerror(
                     "Ошибка доступа",
@@ -2061,24 +1689,14 @@ class ConverterApp:
                     "Скорее всего, он открыт в Word. "
                     "Закройте документ и повторите попытку."
                 )
-
-                self.log(
-                    "[ERROR] Файл заблокирован."
-                )
-
+                self.log("[ERROR] Файл заблокирован.")
                 return
-
             except Exception as exc:
                 messagebox.showerror(
                     "Ошибка",
-                    f"Не удалось получить доступ к файлу:\n"
-                    f"{exc}"
+                    f"Не удалось получить доступ к файлу:\n{exc}"
                 )
-
-                self.log(
-                    f"[ERROR] Ошибка доступа: {exc}"
-                )
-
+                self.log(f"[ERROR] Ошибка доступа: {exc}")
                 return
 
         self.log("\n--- Запуск обработки ---")
@@ -2087,50 +1705,52 @@ class ConverterApp:
             MathcadParser.sig_figs_small = (
                 self.sig_figs_small_var.get()
             )
-
             MathcadParser.sig_figs_large = (
                 self.sig_figs_large_var.get()
             )
-
             self.log(
                 "[INFO] Округление: "
-                f"малые числа = "
-                f"{MathcadParser.sig_figs_small}, "
-                f"большие числа = "
-                f"{MathcadParser.sig_figs_large}"
+                f"малые числа = {MathcadParser.sig_figs_small}, "
+                f"большие числа = {MathcadParser.sig_figs_large}"
             )
-
         except Exception:
             self.log(
                 "[WARN] Ошибка чтения настроек округления. "
                 "Используются значения 4 и 8."
             )
-
             MathcadParser.sig_figs_small = 4
             MathcadParser.sig_figs_large = 8
 
+        # Режим формы комплексных чисел.
+        try:
+            complex_form = self.complex_form_var.get()
+        except Exception:
+            complex_form = "polar"
+
+        MathcadParser.complex_to_polar = (complex_form == "polar")
+
         self.log(
-            "[INFO] Парсинг XML файла Mathcad..."
+            "[INFO] Форма комплексных чисел: "
+            + (
+                "полярная ( |z|∠φ° )"
+                if MathcadParser.complex_to_polar
+                else "декартова ( a + ib )"
+            )
         )
 
-        try:
-            markdown_content = (
-                MathcadParser.process_file(
-                    self.input_file
-                )
-            )
+        self.log("[INFO] Парсинг XML файла Mathcad...")
 
+        try:
+            markdown_content = MathcadParser.process_file(
+                self.input_file
+            )
             if not markdown_content.strip():
                 self.log(
                     "[WARN] Файл не содержит текста "
                     "или распознанных формул."
                 )
-
         except Exception as exc:
-            self.log(
-                f"[ERROR] Ошибка парсинга: {exc}"
-            )
-
+            self.log(f"[ERROR] Ошибка парсинга: {exc}")
             return
 
         success = WordConverter.convert_to_word(
@@ -2146,7 +1766,6 @@ class ConverterApp:
                 f"Документ сохранен:\n{output_file}\n\n"
                 "Открыть файл сейчас?"
             )
-
             if open_now:
                 self.open_file(output_file)
 
@@ -2155,17 +1774,12 @@ class ConverterApp:
         try:
             if sys.platform == "win32":
                 os.startfile(filepath)
-
             elif sys.platform == "darwin":
                 os.system(f"open '{filepath}'")
-
             else:
                 os.system(f"xdg-open '{filepath}'")
-
         except Exception as exc:
-            self.log(
-                f"[ERROR] Не удалось открыть файл: {exc}"
-            )
+            self.log(f"[ERROR] Не удалось открыть файл: {exc}")
 
 
 if __name__ == "__main__":
@@ -2175,7 +1789,6 @@ if __name__ == "__main__":
         root = tk.Tk()
 
     style = ttk.Style(root)
-
     if sys.platform == "win32":
         style.theme_use("vista")
 
