@@ -478,14 +478,31 @@ class MathcadParser:
 
     @classmethod
     def format_angle_symbol(cls, angle_latex):
-        """
+        r"""
         Преобразует угол φ из показателя exp(1i·deg·φ)
         в запись с символом угла: ∠φ°.
+
+        Если перед знаком угла нет числового или буквенного
+        множителя (например, "голый" e^(1j·deg·30)),
+        впереди добавляется единица: 1∠30°.
         """
         if not angle_latex:
-            return r"\angle"
+            return r"1\angle^{\circ}"
 
-        return rf"\angle{angle_latex}^{{\circ}}"
+        stripped = angle_latex.lstrip()
+
+        first_char = stripped[0] if stripped else ""
+
+        starts_with_operand = bool(
+            cls.ANGLE_MARK_RE.match(stripped)
+            or re.match(r"^[-\d,.]", stripped)
+            or re.match(r"^\\[a-zA-Z]", stripped)
+            or re.match(r"^[{]", stripped)
+        ) or first_char.isalpha()
+
+        prefix = "" if starts_with_operand else "1"
+
+        return rf"{prefix}\angle{angle_latex}^{{\circ}}"
 
     @classmethod
     def parse_complex_node(cls, node):
@@ -530,6 +547,90 @@ class MathcadParser:
             imag_value,
             imag_symbol
         )
+
+    ANGLE_MARK_RE = re.compile(r"@@ANGLE\d+@@")
+
+    # Стек словарей меток: каждый распознанный \angle кладёт
+    # свой словарь на вершину; внешний mult забирает все метки
+    # через pop_all_angle_marks().
+    _angle_mark_stack = []
+
+    @classmethod
+    def push_angle_mark(cls, latex):
+        r"""
+        Прячет готовую LaTeX-запись угла (1\angle30^\circ) в
+        защищённую метку @@ANGLEn@@ и возвращает её. Метка будет
+        развернута обратно внешним обработчиком умножения.
+        """
+        mark = f"@@ANGLE{len(cls._angle_mark_stack)}@@"
+        cls._angle_mark_stack.append({mark: latex})
+        return mark
+
+    @classmethod
+    def pop_all_angle_marks(cls):
+        """Возвращает и очищает все накопленные метки углов."""
+        merged = {}
+
+        for marks in cls._angle_mark_stack:
+            merged.update(marks)
+
+        cls._angle_mark_stack.clear()
+
+        return merged
+
+    @classmethod
+    def restore_angle_symbols(cls, text, marks):
+        """Возвращает защищённые метки обратно в \angle-запись."""
+        for mark, latex in marks.items():
+            text = text.replace(mark, latex)
+
+        return text
+
+    @staticmethod
+    def is_unit_factor(node):
+        """
+        Проверяет, является ли узел множитель-единица:
+        <real>1</real> или <complex><real>1</real></complex>.
+        """
+        if node is None:
+            return False
+
+        tag = MathcadParser.strip_ns(node.tag)
+
+        if tag == "real":
+            return (node.text or "").strip() == "1"
+
+        if tag == "complex":
+            real_node = next(
+                (
+                    child for child in node
+                    if MathcadParser.strip_ns(child.tag) == "real"
+                ),
+                None
+            )
+
+            imag_node = next(
+                (
+                    child for child in node
+                    if MathcadParser.strip_ns(child.tag) == "imag"
+                ),
+                None
+            )
+
+            real_ok = (
+                real_node is not None
+                and (real_node.text or "").strip() == "1"
+            )
+
+            imag_empty = (
+                imag_node is None
+                or not (imag_node.text or "").strip()
+                or (imag_node.text or "").strip() == "0"
+            )
+
+            return real_ok and imag_empty
+
+        return False
 
     @staticmethod
     def is_complex_latex(latex):
@@ -839,12 +940,67 @@ class MathcadParser:
             ]
 
             if op == "mult":
-                if len(args) > 1:
-                    return (
-                        f"{args[0]} \\cdot {args[1]}"
+                def is_angle_mark(text):
+                    """Узел — целиком защищённая метка угла."""
+                    return bool(
+                        cls.ANGLE_MARK_RE.fullmatch(text.strip())
                     )
 
-                return args[0] if args else ""
+                # 1) Явная единица перед знаком угла оставляем:
+                #    1·e^(1j·deg·30) -> 1\angle30^\circ
+                if (
+                    len(args) > 1
+                    and is_angle_mark(args[1])
+                    and cls.is_unit_factor(children[1])
+                ):
+                    angle_marks = cls.pop_all_angle_marks()
+
+                    return cls.restore_angle_symbols(
+                        f"1 {args[1]}", angle_marks
+                    ).replace(" ", "", 0)
+
+                # 2) Убираем "съеденные" единицы перед углом,
+                #    если они оказались бы лишними.
+                cleaned = []
+
+                for idx, arg in enumerate(args):
+                    operand_node = (
+                        children[1 + idx]
+                        if 1 + idx < len(children)
+                        else None
+                    )
+
+                    if (
+                        is_angle_mark(arg)
+                        and cls.is_unit_factor(operand_node)
+                    ):
+                        continue
+
+                    cleaned.append(arg)
+
+                if not cleaned:
+                    cleaned = ["1"]
+
+                marks_to_restore = {}
+
+                # 3) Собираем произведение: между обычными
+                #    множителями ставим \cdot; рядом с меткой
+                #    угла — без разделителя и без пробела.
+                result = cleaned[0]
+
+                for arg in cleaned[1:]:
+                    if is_angle_mark(result) or is_angle_mark(arg):
+                        result += arg
+                    else:
+                        result += f" \\cdot {arg}"
+
+                marks_to_restore = cls.pop_all_angle_marks()
+
+                restored = cls.restore_angle_symbols(
+                    result, marks_to_restore
+                )
+
+                return restored
 
             if op == "div":
                 if len(args) > 1:
@@ -900,8 +1056,11 @@ class MathcadParser:
                     )
 
                     if angle_latex is not None:
-                        return cls.format_angle_symbol(
-                            angle_latex
+                        # Готовая запись вида 1\angle30^\circ или
+                        # \angle30^\circ прячется в метку, чтобы
+                        # внешнее умножение не вставило \cdot.
+                        return cls.push_angle_mark(
+                            cls.format_angle_symbol(angle_latex)
                         )
 
                 if len(args) > 1:
