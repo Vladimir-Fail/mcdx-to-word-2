@@ -1,7 +1,7 @@
 import math
 import os
+import re
 import sys
-import re  # Добавлено для работы с регулярными выражениями
 import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -239,73 +239,6 @@ class MathcadParser:
         return angle
 
     @classmethod
-    def fix_polar_form(cls, latex):
-        """
-        Заменяет экспоненциальную запись комплексных чисел вида
-        r \cdot e^{1 \cdot i \cdot deg \cdot \theta}
-        на полярную форму с уголком:
-        r \angle \theta^\circ
-        """
-        # Регулярное выражение для поиска экспоненциальной записи.
-        # Поддерживает до 2 уровней вложенности фигурных и круглых скобок
-        # (например, для дробей \frac{a}{\frac{b}{c}} или \left( ... \right)).
-        # Также учитывает возможное форматирование mathit/mathrm для e, i, j и deg.
-        pattern_str = (
-            r"(\\cdot\s*)?(?:"
-            r"(?:\{e\}|e|\\mathrm\{e\}|\\mathit\{e\})\^\{((?:[^\{\}]|\{(?:[^\{\}]|\{[^\{\}]*\})*\})*)\}"
-            r"|"
-            r"\\mathrm\{exp\}\\left\(((?:[^\(\)]|\((?:[^\(\)]|\([^\(\)]*\))*\))*)\\right\)"
-            r")"
-        )
-        pattern = re.compile(pattern_str, re.IGNORECASE)
-
-        def replacer(match):
-            cdot = match.group(1)
-            exp = match.group(2) or match.group(3)
-
-            # Разбиваем показатель степени по \cdot
-            parts = re.split(r'\s*\\cdot\s*', exp)
-
-            # Подсчитываем количество минусов для определения знака угла
-            minus_count = sum(p.strip().startswith('-') for p in parts)
-            is_negative = (minus_count % 2 == 1)
-
-            def clean_part(p):
-                return p.strip().lstrip('-').strip()
-
-            i_variants = ('i', 'j', r'\mathit{i}', r'\mathit{j}', r'\mathrm{i}', r'\mathrm{j}')
-            deg_variants = ('deg', r'\mathrm{deg}', r'\mathit{deg}')
-
-            has_i = any(clean_part(p) in i_variants for p in parts)
-            has_deg = any(clean_part(p) in deg_variants for p in parts)
-
-            if has_i and has_deg:
-                ignore_base = ('1',) + i_variants + deg_variants
-                angle_parts = []
-
-                for p in parts:
-                    cp = clean_part(p)
-                    if cp not in ignore_base:
-                        angle_parts.append(clean_part(p))
-
-                if angle_parts:
-                    angle_val = r" \cdot ".join(angle_parts).strip()
-                    if is_negative:
-                        angle_val = "- " + angle_val
-                else:
-                    angle_val = "- 1" if is_negative else "1"
-
-                if cdot:
-                    return rf"\angle {angle_val}^\circ"
-                else:
-                    return rf"1 \angle {angle_val}^\circ"
-
-            # Если это не полярная форма, возвращаем исходную строку
-            return match.group(0)
-
-        return pattern.sub(replacer, latex)
-
-    @classmethod
     def calculate_complex_polar(cls, real_value, imag_value):
         """
         Вычисляет модуль и угол комплексного числа.
@@ -342,17 +275,39 @@ class MathcadParser:
 
         return modulus, angle
 
-    @classmethod
-    def parse_complex(cls, real_value, imag_value):
+    @staticmethod
+    def get_imag_symbol(node):
         """
-        Преобразует a + ib в:
+        Возвращает символ мнимой единицы из XML-узла <imag>.
 
-            |z| angle angle°
+        В Mathcad комплексная единица может быть настроена
+        как i или как j — в XML это атрибут symbol:
+
+            <ml:imag symbol="j">1</ml:imag>
+
+        Если атрибут отсутствует, используется "i"
+        (значение Mathcad по умолчанию).
+        """
+        if node is None:
+            return "i"
+
+        return (node.attrib.get("symbol") or "i").strip() or "i"
+
+    @classmethod
+    def parse_complex(cls, real_value, imag_value, imag_symbol="i"):
+        """
+        Преобразует a + jb в:
+
+            |z| ∠ угол°
 
         Например:
 
-            1 + i  -> 1,414 angle 45°
-            1 - i  -> 1,414 angle -45°
+            1 + j  -> 1,414 ∠45°
+            1 - j  -> 1,414 ∠-45°
+
+        imag_symbol — символ мнимой единицы ("i" или "j"),
+        используемый только в резервной декартовой записи,
+        когда значение не удалось вычислить численно.
         """
         try:
             modulus, angle = cls.calculate_complex_polar(
@@ -377,7 +332,7 @@ class MathcadParser:
                 else "+"
             )
 
-            return f"{real_text}{sign}{imag_text}i"
+            return f"{real_text}{sign}{imag_text}{imag_symbol}"
 
         modulus_text = cls.format_num(
             str(modulus)
@@ -389,9 +344,165 @@ class MathcadParser:
 
         return (
             rf"{modulus_text}"
-            rf"\angle "
+            rf"\angle"
             rf"{angle_text}^\circ"
         )
+
+    @staticmethod
+    def is_degree_unit(node):
+        """
+        Проверяет, что XML-узел — единица измерения deg.
+
+        Пример Mathcad: <id>deg</id>
+        """
+        if node is None:
+            return False
+
+        if MathcadParser.strip_ns(node.tag) != "id":
+            return False
+
+        return (node.text or "").strip() == "deg"
+
+    @classmethod
+    def is_euler_base(cls, node):
+        """
+        Проверяет, что узел — константа e (основание
+        экспоненты).
+
+        Mathcad записывает её как <id>e</id> или <e/>.
+        """
+        if node is None:
+            return False
+
+        tag = cls.strip_ns(node.tag)
+
+        if tag == "e":
+            return True
+
+        if tag in ("id", "sym"):
+            base = (node.text or "").strip()
+
+            # Имя с индексом — это переменная, а не константа e
+            for key in node.attrib:
+                if cls.strip_ns(key) == "subscript":
+                    return False
+
+            return base == "e"
+
+        return False
+
+    @classmethod
+    def extract_polar_angle_degrees(cls, node):
+        """
+        Пытается распознать показатель степени вида
+        1i·deg·φ (запись угла в градусах в экспоненциальной
+        форме e^(1i·deg·φ)).
+
+        Структура XML Mathcad:
+
+            <apply>
+                <mult/>
+                <apply>
+                    <mult/>
+                    <imag symbol="j">1</imag>   (или 1i / 1j)
+                    <id>deg</id>
+                </apply>
+                <real>120</real>               (сам угол)
+            </apply>
+
+        Возвращает LaTeX-строку угла (число или выражение)
+        либо None, если узел не является полярным показателем.
+        """
+        if node is None:
+            return None
+
+        children = list(node)
+
+        if not children:
+            return None
+
+        op = cls.strip_ns(children[0].tag)
+
+        if op != "mult":
+            return None
+
+        operands = children[1:]
+
+        if len(operands) < 2:
+            return None
+
+        def operand_is_i_times_deg(operand):
+            """Группа 1i · deg (порядок множителей любой)."""
+            parts = list(operand)
+
+            if not parts:
+                return False
+
+            if cls.strip_ns(parts[0].tag) != "mult":
+                return False
+
+            factors = parts[1:]
+
+            has_imag = any(
+                cls.strip_ns(p.tag) == "imag" for p in factors
+            )
+
+            has_deg = any(
+                cls.is_degree_unit(p) for p in factors
+            )
+
+            return has_imag and has_deg
+
+        i_deg_found = False
+        angle_parts = []
+
+        for operand in operands:
+            if operand_is_i_times_deg(operand):
+                if i_deg_found:
+                    return None
+                i_deg_found = True
+                continue
+
+            latex = cls.parse_node_to_latex(operand)
+
+            if latex:
+                angle_parts.append(latex)
+
+        if not i_deg_found or not angle_parts:
+            return None
+
+        if len(angle_parts) == 1:
+            return angle_parts[0]
+
+        return " \\cdot ".join(angle_parts)
+
+    @classmethod
+    def format_angle_symbol(cls, angle_latex):
+        r"""
+        Преобразует угол φ из показателя exp(1i·deg·φ)
+        в запись с символом угла: ∠φ°.
+
+        Если перед знаком угла нет числового или буквенного
+        множителя (например, "голый" e^(1j·deg·30)),
+        впереди добавляется единица: 1∠30°.
+        """
+        if not angle_latex:
+            return r"1\angle^{\circ}"
+
+        stripped = angle_latex.lstrip()
+
+        first_char = stripped[0] if stripped else ""
+
+        starts_with_operand = bool(
+            cls.ANGLE_MARK_RE.match(stripped)
+            or re.match(r"^[-\d,.]", stripped)
+            or re.match(r"^\\[a-zA-Z]", stripped)
+            or re.match(r"^[{]", stripped)
+        ) or first_char.isalpha()
+
+        prefix = "" if starts_with_operand else "1"
+
+        return rf"{prefix}\angle{angle_latex}^{{\circ}}"
 
     @classmethod
     def parse_complex_node(cls, node):
@@ -426,10 +537,100 @@ class MathcadParser:
             else "0"
         )
 
+        # Символ мнимой единицы ("i" или "j") берётся из
+        # атрибута <imag symbol="..."> — пользователь мог
+        # настроить в Mathcad комплексную единицу как j.
+        imag_symbol = cls.get_imag_symbol(imag_node)
+
         return cls.parse_complex(
             real_value,
-            imag_value
+            imag_value,
+            imag_symbol
         )
+
+    ANGLE_MARK_RE = re.compile(r"@@ANGLE\d+@@")
+
+    # Стек словарей меток: каждый распознанный \angle кладёт
+    # свой словарь на вершину; внешний mult забирает все метки
+    # через pop_all_angle_marks().
+    _angle_mark_stack = []
+
+    @classmethod
+    def push_angle_mark(cls, latex):
+        r"""
+        Прячет готовую LaTeX-запись угла (1\angle30^\circ) в
+        защищённую метку @@ANGLEn@@ и возвращает её. Метка будет
+        развернута обратно внешним обработчиком умножения.
+        """
+        mark = f"@@ANGLE{len(cls._angle_mark_stack)}@@"
+        cls._angle_mark_stack.append({mark: latex})
+        return mark
+
+    @classmethod
+    def pop_all_angle_marks(cls):
+        """Возвращает и очищает все накопленные метки углов."""
+        merged = {}
+
+        for marks in cls._angle_mark_stack:
+            merged.update(marks)
+
+        cls._angle_mark_stack.clear()
+
+        return merged
+
+    @classmethod
+    def restore_angle_symbols(cls, text, marks):
+        """Возвращает защищённые метки обратно в \angle-запись."""
+        for mark, latex in marks.items():
+            text = text.replace(mark, latex)
+
+        return text
+
+    @staticmethod
+    def is_unit_factor(node):
+        """
+        Проверяет, является ли узел множитель-единица:
+        <real>1</real> или <complex><real>1</real></complex>.
+        """
+        if node is None:
+            return False
+
+        tag = MathcadParser.strip_ns(node.tag)
+
+        if tag == "real":
+            return (node.text or "").strip() == "1"
+
+        if tag == "complex":
+            real_node = next(
+                (
+                    child for child in node
+                    if MathcadParser.strip_ns(child.tag) == "real"
+                ),
+                None
+            )
+
+            imag_node = next(
+                (
+                    child for child in node
+                    if MathcadParser.strip_ns(child.tag) == "imag"
+                ),
+                None
+            )
+
+            real_ok = (
+                real_node is not None
+                and (real_node.text or "").strip() == "1"
+            )
+
+            imag_empty = (
+                imag_node is None
+                or not (imag_node.text or "").strip()
+                or (imag_node.text or "").strip() == "0"
+            )
+
+            return real_ok and imag_empty
+
+        return False
 
     @staticmethod
     def is_complex_latex(latex):
@@ -723,9 +924,14 @@ class MathcadParser:
                         else "0"
                     )
 
+                    imag_symbol = cls.get_imag_symbol(
+                        second_node
+                    )
+
                     return cls.parse_complex(
                         real_value,
-                        imag_value
+                        imag_value,
+                        imag_symbol
                     )
 
             args = [
@@ -734,12 +940,67 @@ class MathcadParser:
             ]
 
             if op == "mult":
-                if len(args) > 1:
-                    return (
-                        f"{args[0]} \\cdot {args[1]}"
+                def is_angle_mark(text):
+                    """Узел — целиком защищённая метка угла."""
+                    return bool(
+                        cls.ANGLE_MARK_RE.fullmatch(text.strip())
                     )
 
-                return args[0] if args else ""
+                # 1) Явная единица перед знаком угла оставляем:
+                #    1·e^(1j·deg·30) -> 1\angle30^\circ
+                if (
+                    len(args) > 1
+                    and is_angle_mark(args[1])
+                    and cls.is_unit_factor(children[1])
+                ):
+                    angle_marks = cls.pop_all_angle_marks()
+
+                    return cls.restore_angle_symbols(
+                        f"1 {args[1]}", angle_marks
+                    ).replace(" ", "", 0)
+
+                # 2) Убираем "съеденные" единицы перед углом,
+                #    если они оказались бы лишними.
+                cleaned = []
+
+                for idx, arg in enumerate(args):
+                    operand_node = (
+                        children[1 + idx]
+                        if 1 + idx < len(children)
+                        else None
+                    )
+
+                    if (
+                        is_angle_mark(arg)
+                        and cls.is_unit_factor(operand_node)
+                    ):
+                        continue
+
+                    cleaned.append(arg)
+
+                if not cleaned:
+                    cleaned = ["1"]
+
+                marks_to_restore = {}
+
+                # 3) Собираем произведение: между обычными
+                #    множителями ставим \cdot; рядом с меткой
+                #    угла — без разделителя и без пробела.
+                result = cleaned[0]
+
+                for arg in cleaned[1:]:
+                    if is_angle_mark(result) or is_angle_mark(arg):
+                        result += arg
+                    else:
+                        result += f" \\cdot {arg}"
+
+                marks_to_restore = cls.pop_all_angle_marks()
+
+                restored = cls.restore_angle_symbols(
+                    result, marks_to_restore
+                )
+
+                return restored
 
             if op == "div":
                 if len(args) > 1:
@@ -770,6 +1031,38 @@ class MathcadParser:
                 return f"-{args[0]}" if args else "-"
 
             if op == "pow":
+                # Полярная запись угла Mathcad:
+                #
+                #     e^(1i·deg·φ)  ->  ∠φ°
+                #
+                # Проверяем исходные XML-узлы, а не LaTeX:
+                # основание — константа e, показатель —
+                # произведение 1i·deg и самого угла.
+                base_node = (
+                    children[1]
+                    if len(children) > 1
+                    else None
+                )
+
+                exp_node = (
+                    children[2]
+                    if len(children) > 2
+                    else None
+                )
+
+                if cls.is_euler_base(base_node):
+                    angle_latex = cls.extract_polar_angle_degrees(
+                        exp_node
+                    )
+
+                    if angle_latex is not None:
+                        # Готовая запись вида 1\angle30^\circ или
+                        # \angle30^\circ прячется в метку, чтобы
+                        # внешнее умножение не вставило \cdot.
+                        return cls.push_angle_mark(
+                            cls.format_angle_symbol(angle_latex)
+                        )
+
                 if len(args) > 1:
                     return (
                         f"{{{args[0]}}}"
@@ -1129,9 +1422,6 @@ class MathcadParser:
                     )
 
                 if latex:
-                    # Применяем замену экспоненциальной формы на полярную с уголком
-                    latex = cls.fix_polar_form(latex)
-                    
                     content.append(
                         f"$$ {latex} $$\n\n"
                     )
