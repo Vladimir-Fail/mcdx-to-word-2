@@ -344,7 +344,7 @@ class MathcadParser:
 
         return (
             rf"{modulus_text}"
-            rf"\angle "
+            rf"\angle"
             rf"{angle_text}^\circ"
         )
 
@@ -485,7 +485,7 @@ class MathcadParser:
         if not angle_latex:
             return r"\angle"
 
-        return rf"\angle\ {angle_latex}^{{\circ}}"
+        return rf"\angle{angle_latex}^{{\circ}}"
 
     @classmethod
     def parse_complex_node(cls, node):
