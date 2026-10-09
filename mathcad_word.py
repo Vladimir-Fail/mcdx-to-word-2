@@ -47,6 +47,37 @@ attribute entirely and always render `j`. If you ever need to
 support worksheets genuinely authored with `i`, reintroduce a
 class-level toggle and thread it through the parser — but do NOT
 trust `symbol` in `symResult`; it lies.
+
+IMPORTANT — TRAILING-DOT SUBSCRIPTS
+-----------------------------------
+Mathcad sometimes writes a subscript with a trailing dot, e.g.
+`<ml:id subscript="1.">X</ml:id>` (the on-screen `X.1.`). The dot
+is a Mathcad placeholder that terminates the index but is not part
+of the variable name. If we render it verbatim we get `X_{1.}`
+which reads as if a digit is missing after the dot. We therefore
+replace ONLY THE LAST character of the subscript — and only when it
+is a dot — with a single `*`, producing `X_{1*}`.
+
+Crucially, only the FINAL dot is replaced. Earlier dots in the
+subscript are left intact. For example:
+
+    subscript="1."       →  "1*"
+    subscript="2'.1.."   →  "2'.1.*"   (the second-to-last dot stays)
+    subscript="2'.1."    →  "2'.1*"
+
+An earlier version of this file used `rstrip(".")` which stripped
+EVERY trailing dot — turning `2'.1..` into `2'.1*` and silently
+eating one of the user's dots. That is wrong: Mathcad only ever
+treats the very last dot as a terminator.
+
+IMPORTANT — ON-AXIS COMPLEX NUMBERS
+-----------------------------------
+Mathcad normally displays complex numbers in polar form
+`|z|∠φ°`. But when the point lies exactly on one of the axes
+(angle 0°, ±90°, 180° — i.e. one of the two parts is zero), the
+polar form is silly (`5∠0°`) or confusing (`5∠180°` for `-5`).
+For those cases we emit the rectangular form (`5`, `-5`, `5j`,
+`-5j`). Only genuinely off-axis numbers get `r∠φ°`.
 """
 
 import math
@@ -117,6 +148,11 @@ class MathcadParser:
     # there. You would have to scan the input side for the first
     # user-chosen symbol and remember it across the whole parse.
     IMAGINARY_SYMBOL = "j"
+
+    # Tolerance for "this value is zero" checks (real/imag parts).
+    # Chosen to be much larger than the smallest denormal double but
+    # far below any physically meaningful number in a worksheet.
+    AXIS_EPS = 1e-12
 
     # -------------------------------------------------------------------
     # Angle-mark machinery (deferred ∠ substitution)
@@ -391,6 +427,10 @@ class MathcadParser:
         inside \\text{...}. Mathcad identifiers frequently contain
         characters like "_", "%", "&", "#" that would otherwise break
         LaTeX compilation.
+
+        NOTE: The asterisk `*` is deliberately NOT escaped — the
+        trailing-dot-subscript quirk relies on emitting a literal `*`
+        for subscripts like `1.` → `1*`.
         """
         replacements = {
             "\\": r"\textbackslash{}",
@@ -425,6 +465,28 @@ class MathcadParser:
                  Example: <ml:id subscript="0">Xw1</ml:id> → Xw1_0.
               2. Inside the text itself, e.g. "R.max".
             Both forms appear in real worksheets. We support both.
+
+        NOTE (trailing-dot subscripts):
+            Mathcad sometimes stores a subscript with a trailing dot,
+            e.g. <ml:id subscript="1.">X</ml:id>, which corresponds to
+            the on-screen Mathcad notation `X.1.` (a variable whose
+            "index" ends with a dot before the definition symbol). The
+            trailing dot is a Mathcad placeholder, not part of the
+            variable name. If we render it verbatim the subscript reads
+            as `X_{1.}` — as if a digit is missing after the dot.
+
+            We replace ONLY THE LAST character of the subscript — and
+            only when it is a dot — with a single `*`. Any dots that
+            appear earlier inside the subscript are preserved:
+
+                subscript="1."       →  "1*"
+                subscript="2'.1.."   →  "2'.1.*"   (earlier dot kept)
+                subscript="2'.1."    →  "2'.1*"
+
+            Earlier versions of this file used `rstrip(".")`, which
+            stripped EVERY trailing dot and therefore ate legitimate
+            dots in indices like `2'.1..`. Do not reintroduce that —
+            Mathcad only ever treats the very last dot as a terminator.
 
         NOTE (function flag):
             When a bare <id> is used as a function (e.g. `pp(z)`), we
@@ -463,6 +525,12 @@ class MathcadParser:
             base_latex = rf"\mathrm{{{base_latex}}}"
 
         if subscript is not None and subscript != "":
+            # NOTE (trailing-dot subscripts): replace only the LAST
+            # character, and only if it is a dot. Do NOT use rstrip —
+            # that would eat legitimate earlier dots.
+            if subscript.endswith("."):
+                subscript = subscript[:-1] + "*"
+
             subscript_latex = cls.escape_latex(subscript)
 
             return (
@@ -594,31 +662,68 @@ class MathcadParser:
     @classmethod
     def parse_complex(cls, real_value, imag_value, imag_symbol=None):
         r"""
-        Render a rectangular complex number as polar: |z|\angle\phi^\circ.
+        Render a rectangular complex number.
 
-        NOTE: This is Mathcad's "polar display" convention for complex
-        results. If the rectangular form fails to parse (e.g. symbolic
-        results contain variables), we fall back to a + bj display.
+        MATHCAD QUIRK (polar vs. rectangular display):
+            Mathcad normally displays complex numbers in polar form
+            `|z|\angle\phi^\circ`. However, when the number lies
+            EXACTLY on one of the axes — i.e. when one of its parts
+            (real or imaginary) is numerically zero — the polar form
+            is misleading:
 
-        NOTE (imag_symbol): The `imag_symbol` argument is kept for
-        call-site compatibility but the FINAL displayed symbol is
-        always `cls.IMAGINARY_SYMBOL`. Do not "optimise" this away —
-        callers still pass the per-node symbol, and we deliberately
-        normalise it here too so the fallback branch is consistent.
+                -5 + 0j   →   5\angle 180^\circ   (reads worse than -5)
+                +5 + 0j   →   5\angle 0^\circ     (silly)
+                 0 + 5j   →   5\angle 90^\circ    (unusual notation)
+                 0 - 5j   →   5\angle -90^\circ
+
+            For those cases we fall back to the rectangular form:
+            `-5`, `5`, `5j`, `-5j`. This mirrors what Mathcad itself
+            shows on screen for on-axis results.
+
+            The off-axis case (both parts non-zero) keeps the polar
+            form `r\angle\phi^\circ`.
+
+        NOTE (imag_symbol):
+            The `imag_symbol` argument is kept for call-site
+            compatibility, but the FINAL displayed symbol is always
+            `cls.IMAGINARY_SYMBOL`. See the module-level note
+            "IMPORTANT — IMAGINARY UNIT" for why the per-node symbol
+            cannot be trusted.
         """
         symbol = cls.IMAGINARY_SYMBOL
 
+        # --- Try to interpret both parts as numbers -------------------
         try:
-            modulus, angle = cls.calculate_complex_polar(
-                real_value, imag_value
-            )
+            real_float = float(real_value)
+            imag_float = float(imag_value)
+            numeric = True
         except (ValueError, TypeError):
+            numeric = False
+
+        # --- Non-numeric (symbolic) parts: plain concatenation --------
+        if not numeric:
             real_text = cls.format_num(str(real_value))
             imag_text = cls.format_num(str(imag_value))
-
             sign = "" if imag_text.startswith("-") else "+"
-
             return f"{real_text}{sign}{imag_text}{symbol}"
+
+        # --- On-axis check --------------------------------------------
+        # If either part is numerically zero the point lies on one of
+        # the axes (angle 0°, ±90°, 180°). Use rectangular form.
+        on_axis = (
+            math.isclose(real_float, 0.0, abs_tol=cls.AXIS_EPS)
+            or math.isclose(imag_float, 0.0, abs_tol=cls.AXIS_EPS)
+        )
+
+        if on_axis:
+            return cls._format_rectangular(
+                real_float, imag_float, symbol
+            )
+
+        # --- Off-axis: polar form -------------------------------------
+        modulus, angle = cls.calculate_complex_polar(
+            real_float, imag_float
+        )
 
         modulus_text = cls.format_num(str(modulus))
         angle_text = cls.format_angle_value(angle)
@@ -628,6 +733,59 @@ class MathcadParser:
             rf"\angle"
             rf"{angle_text}^\circ"
         )
+
+    @classmethod
+    def _format_rectangular(cls, real_value, imag_value, symbol):
+        r"""
+        Render a complex number in rectangular form, omitting parts
+        that are numerically zero.
+
+        Examples:
+            ( 5,  0) → "5"      (pure real)
+            (-5,  0) → "-5"
+            ( 0,  5) → "5j"     (pure imaginary)
+            ( 0, -5) → "-5j"
+            ( 0,  1) → "j"
+            ( 0, -1) → "-j"
+            ( 2,  3) → "2 + 3j" (safety net — normally not reached
+                                 via the on-axis branch)
+        """
+        r_zero = math.isclose(
+            real_value, 0.0, abs_tol=cls.AXIS_EPS
+        )
+        m_zero = math.isclose(
+            imag_value, 0.0, abs_tol=cls.AXIS_EPS
+        )
+
+        if r_zero and m_zero:
+            return "0"
+
+        if m_zero:
+            # Pure real number.
+            return cls.format_num(str(real_value))
+
+        if r_zero:
+            # Pure imaginary number.
+            sign = "-" if imag_value < 0 else ""
+            abs_imag = abs(imag_value)
+
+            if math.isclose(abs_imag, 1.0, abs_tol=cls.AXIS_EPS):
+                return f"{sign}{symbol}"
+
+            imag_text = cls.format_num(str(abs_imag))
+            return f"{sign}{imag_text}{symbol}"
+
+        # Both parts non-zero. This branch is not reached from the
+        # axis path in `parse_complex`, but we keep it for safety.
+        real_text = cls.format_num(str(real_value))
+        sign = "-" if imag_value < 0 else "+"
+        abs_imag = abs(imag_value)
+
+        if math.isclose(abs_imag, 1.0, abs_tol=cls.AXIS_EPS):
+            return f"{real_text} {sign} {symbol}"
+
+        imag_text = cls.format_num(str(abs_imag))
+        return f"{real_text} {sign} {imag_text}{symbol}"
 
     # -------------------------------------------------------------------
     # Detection of complex-exponential notation (∠ in exponent form)
@@ -1537,6 +1695,10 @@ class MathcadParser:
             # Mathcad evaluates `a + b·j` with numeric a, b into a
             # complex result. We intercept this shape and produce the
             # polar display `|z|∠φ°` instead of `a + bj`.
+            #
+            # NOTE (on-axis): parse_complex itself now downgrades
+            # on-axis results (angle 0°, ±90°, 180°) to rectangular
+            # form, so `5 + 0j` → `5`, `0 + 5j` → `5j`, etc.
             if op == "plus" and len(children) >= 3:
                 first_node = children[1]
                 second_node = children[2]
