@@ -28,6 +28,25 @@ Two numeric-formatting knobs matter downstream:
 The parser uses a Russian-locale convention: decimal comma ",".
 This matches how Mathcad regional output looks and how the resulting
 Word document is expected to read.
+
+IMPORTANT — IMAGINARY UNIT
+--------------------------
+The imaginary unit is FORCED to `j` everywhere via `IMAGINARY_SYMBOL`.
+Rationale:
+
+    * In the *input* part of `<eval>`/`<symEval>` Mathcad records
+      `<ml:imag symbol="j">1</ml:imag>` if the user chose `j`.
+    * But in `<symResult>` the symbolic engine ALWAYS re-emits the
+      imaginary unit with `symbol="i"`, regardless of what the user
+      typed. So after `explicit ALL` you get `i` even in a worksheet
+      that was authored with `j`.
+
+This mismatch used to leak into the output (`j` in inputs, `i` in
+symbolic results). To fix it we IGNORE the per-node `symbol`
+attribute entirely and always render `j`. If you ever need to
+support worksheets genuinely authored with `i`, reintroduce a
+class-level toggle and thread it through the parser — but do NOT
+trust `symbol` in `symResult`; it lies.
 """
 
 import math
@@ -82,6 +101,22 @@ class MathcadParser:
     # Scientific-notation threshold: numbers with |x| < 10^sci_threshold
     # are rendered as "m·10^k". `None` disables the feature.
     sci_threshold = None
+
+    # -------------------------------------------------------------------
+    # Imaginary-unit symbol
+    # -------------------------------------------------------------------
+    #
+    # The single source of truth for how the imaginary unit is rendered.
+    # We FORCE "j" here on purpose; see the module-level note
+    # "IMPORTANT — IMAGINARY UNIT" for why the per-node `symbol`
+    # attribute cannot be trusted.
+    #
+    # If a future maintainer needs to support worksheets authored with
+    # `i`, change this constant — but be aware this will NOT fix the
+    # `symResult` case by itself, because Mathcad always emits `i`
+    # there. You would have to scan the input side for the first
+    # user-chosen symbol and remember it across the whole parse.
+    IMAGINARY_SYMBOL = "j"
 
     # -------------------------------------------------------------------
     # Angle-mark machinery (deferred ∠ substitution)
@@ -534,30 +569,45 @@ class MathcadParser:
 
         return modulus, angle
 
-    @staticmethod
-    def get_imag_symbol(node):
+    @classmethod
+    def get_imag_symbol(cls, node=None):
         """
-        Get the imaginary-unit symbol ("i" or "j") from an <imag> node.
+        Return the symbol used for the imaginary unit.
 
-        NOTE: Mathcad lets users choose between "i" and "j" for the
-        imaginary unit. The symbol is stored as an XML attribute, so a
-        worksheet can technically mix both notations. We respect the
-        attribute per-node rather than forcing one global choice.
+        CRITICAL — DO NOT READ `symbol` FROM THE NODE HERE.
+        --------------------------------------------------
+        See the module-level note "IMPORTANT — IMAGINARY UNIT".
+        Mathcad's symbolic engine ALWAYS re-emits the imaginary unit
+        with symbol="i" inside `<symResult>`, even if the user wrote
+        `j`. The input side may contain symbol="j". If we honoured
+        the attribute we would produce mixed `i`/`j` output in the
+        same document (this was the original bug: `a := 1e^(j·deg·120)`
+        rendered fine, but after `explicit ALL` the result turned
+        into `i`).
+
+        We therefore IGNORE the node and always return
+        `cls.IMAGINARY_SYMBOL`. The `node` argument is kept for
+        signature compatibility with existing call sites.
         """
-        if node is None:
-            return "i"
-
-        return (node.attrib.get("symbol") or "i").strip() or "i"
+        return cls.IMAGINARY_SYMBOL
 
     @classmethod
-    def parse_complex(cls, real_value, imag_value, imag_symbol="i"):
+    def parse_complex(cls, real_value, imag_value, imag_symbol=None):
         r"""
         Render a rectangular complex number as polar: |z|\angle\phi^\circ.
 
         NOTE: This is Mathcad's "polar display" convention for complex
         results. If the rectangular form fails to parse (e.g. symbolic
         results contain variables), we fall back to a + bj display.
+
+        NOTE (imag_symbol): The `imag_symbol` argument is kept for
+        call-site compatibility but the FINAL displayed symbol is
+        always `cls.IMAGINARY_SYMBOL`. Do not "optimise" this away —
+        callers still pass the per-node symbol, and we deliberately
+        normalise it here too so the fallback branch is consistent.
         """
+        symbol = cls.IMAGINARY_SYMBOL
+
         try:
             modulus, angle = cls.calculate_complex_polar(
                 real_value, imag_value
@@ -568,7 +618,7 @@ class MathcadParser:
 
             sign = "" if imag_text.startswith("-") else "+"
 
-            return f"{real_text}{sign}{imag_text}{imag_symbol}"
+            return f"{real_text}{sign}{imag_text}{symbol}"
 
         modulus_text = cls.format_num(str(modulus))
         angle_text = cls.format_angle_value(angle)
@@ -1438,8 +1488,17 @@ class MathcadParser:
         # attribute carries the letter (i or j). We DROP a coefficient
         # of exactly 1 because `1j` reads awkwardly in LaTeX — the bare
         # symbol alone is the correct notation. Same for `-1` → `-j`.
+        #
+        # CRITICAL — DO NOT READ `symbol` FROM THE NODE HERE.
+        # ------------------------------------------------------------
+        # The `symbol` attribute is NOT reliable. In the input side
+        # Mathcad writes whatever the user chose (i or j), but the
+        # symbolic engine ALWAYS emits symbol="i" inside <symResult>.
+        # Reading the attribute here reintroduces the "j becomes i
+        # after explicit all" bug. We therefore use the class constant
+        # `cls.IMAGINARY_SYMBOL` unconditionally.
         if tag == "imag":
-            symbol = node.attrib.get("symbol", "i")
+            symbol = cls.IMAGINARY_SYMBOL
             raw = node.text.strip() if node.text else ""
             number = cls.format_num(raw)
 
@@ -1493,6 +1552,8 @@ class MathcadParser:
                         second_node.text.strip()
                         if second_node.text else "0"
                     )
+                    # NOTE: we deliberately ignore the node's own
+                    # symbol — see the imag branch above.
                     imag_symbol = cls.get_imag_symbol(second_node)
                     return cls.parse_complex(
                         real_value, imag_value, imag_symbol
@@ -1519,6 +1580,7 @@ class MathcadParser:
                     except (ValueError, TypeError):
                         imag_value = f"-({imag_value_raw})"
 
+                    # NOTE: same as above — no per-node symbol.
                     imag_symbol = cls.get_imag_symbol(second_node)
                     return cls.parse_complex(
                         real_value, imag_value, imag_symbol
