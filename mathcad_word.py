@@ -78,6 +78,75 @@ Mathcad normally displays complex numbers in polar form
 polar form is silly (`5∠0°`) or confusing (`5∠180°` for `-5`).
 For those cases we emit the rectangular form (`5`, `-5`, `5j`,
 `-5j`). Only genuinely off-axis numbers get `r∠φ°`.
+
+IMPORTANT — EXPLICIT ALL AND ON-AXIS ANGLES
+-------------------------------------------
+After `explicit ALL` Mathcad may leave complex exponentials such as
+`e^(j·deg·180)` or `e^(j·deg·-90)` in the symbolic result instead of
+collapsing them to `-1` or `-j`. Rendering those as `1∠180°` /
+`1∠-90°` is technically correct but reads badly — on-axis angles are
+always real or purely imaginary, so the rectangular form is clearer.
+
+We therefore detect the `explicit ALL` command inside `<symEval>`
+and, while parsing the corresponding `<symResult>`, render any
+on-axis angle (0°, ±90°, 180°) as a plain number (real or imaginary
+part only). Angles at other values keep the polar `r∠φ°` form.
+Angles outside `<symResult>` — i.e. in the user's original input
+expression — are NOT affected by this rule.
+
+IMPORTANT — "1∠" BEFORE AN ANGLE
+--------------------------------
+Mathcad writes `1·e^(j·deg·φ)` with an explicit modulus of 1, but it
+also writes `Sb·e^(j·deg·φ)` (without any modulus) when the
+coefficient is a variable. The exponential itself always has modulus
+1, so the correct display of such a product is `Sb·1∠φ°` — the "1"
+must be made explicit, otherwise `Sb∠φ°` reads as if `Sb` were the
+modulus.
+
+Rule enforced in `_process_mult_angle_args`:
+  * pure number before the angle  →  the number IS the modulus,
+    no extra "1" (e.g. `2∠120°`);
+  * anything else (letter variable, subscripted identifier,
+    parenthesized expression, empty context) → prepend "1"
+    (e.g. `Sb·1∠120°`).
+
+The check is on the *textual* predecessor of the angle mark, since
+that is what the reader will actually see.
+
+IMPORTANT — SIGN CLEANUP AROUND OPERATORS
+-----------------------------------------
+Three rendering artifacts are avoided at assembly time:
+
+    1. `a + -b`          →  `a - b`
+    2. `a - -b`          →  `a + b`
+    3. `a \cdot -b`      →  `a \cdot \left(-b\right)`
+
+The first two are handled by `_strip_leading_sign` (used inside the
+`plus` / `minus` / `neg` handlers). The third is handled by
+`_needs_parens_after_cdot` (used inside `_process_mult_angle_args`
+when it joins the assembled operands with `\cdot`).
+
+WHY THESE ARISE
+---------------
+`explicit ALL` output frequently contains on-axis exponentials that
+have been collapsed to `-1` or `-j`. Feeding those into a generic
+`+` / `-` / `\cdot` assembly produces strings like
+
+    ... + -100
+    502,04 \cdot -j
+
+which are correct but ugly (and, in the `\cdot` case, technically
+misleading: LaTeX renders the leading `-` of the right factor as a
+binary minus, so `502,04 \cdot -j` reads as `502,04 \cdot (-j)` only
+if the reader squints).
+
+The fixes are purely cosmetic — the underlying expression is
+unchanged — but they dramatically improve readability, especially
+for the complex-arithmetic sections of the worksheet.
+
+Note: we do NOT try to fold `+ (-1)·x` into `- x`, nor do we sort
+factors to put numbers first. Both would require reaching inside
+`\left(...\right)` blocks and offer only marginal cosmetic gain.
 """
 
 import math
@@ -153,6 +222,21 @@ class MathcadParser:
     # Chosen to be much larger than the smallest denormal double but
     # far below any physically meaningful number in a worksheet.
     AXIS_EPS = 1e-12
+
+    # -------------------------------------------------------------------
+    # explicit-ALL flag
+    # -------------------------------------------------------------------
+    #
+    # True only while we are parsing a `<symResult>` whose sibling
+    # `<command>` contains `explicit ALL`. In that mode, on-axis
+    # angles (`e^(j·deg·0°)`, `e^(j·deg·±90°)`, `e^(j·deg·180°)`) are
+    # rendered as plain rectangular numbers instead of polar form.
+    #
+    # The flag is set/reset in `parse_eval_to_latex` around the call
+    # that parses the `<symResult>` child. It is a class attribute
+    # (not an instance attribute) because `MathcadParser` is used as
+    # a namespace of classmethods — see `process_file`.
+    _explicit_all_mode = False
 
     # -------------------------------------------------------------------
     # Angle-mark machinery (deferred ∠ substitution)
@@ -788,6 +872,124 @@ class MathcadParser:
         return f"{real_text} {sign} {imag_text}{symbol}"
 
     # -------------------------------------------------------------------
+    # Sign helpers — used by `plus` / `minus` / `neg` and by the
+    # multiplication assembler to avoid dangling binary operators.
+    #
+    # See the module-level note "IMPORTANT — SIGN CLEANUP AROUND
+    # OPERATORS" for the rationale and the exact transformations.
+    # -------------------------------------------------------------------
+
+    @staticmethod
+    def _strip_leading_sign(text):
+        """
+        Split a LaTeX fragment into a leading sign and the remainder.
+
+        Returns (sign, body) where:
+          * sign is "+" or "-";
+          * body is the fragment without its leading sign (and
+            without leading whitespace).
+
+        If the fragment does not start with a bare "+"/"-" at top
+        level, returns ("+", text.strip()).
+
+        EXAMPLES
+            "100"               →  ("+", "100")
+            "-100"              →  ("-", "100")
+            "+j"                →  ("+", "j")
+            "-j"                →  ("-", "j")
+            "- 502,04"          →  ("-", "502,04")
+            "\\left(-1\\right)" →  ("+", "\\left(-1\\right)")
+            "a + b"             →  ("+", "a + b")
+
+        IMPORTANT
+            We deliberately do NOT peek inside `\\left(...\\right)`
+            or other composite fragments. The leading `-` of a
+            parenthesized negative number is not at top level, so it
+            is not stripped — which is exactly what we want, because
+            the parentheses already disambiguate.
+        """
+        stripped = text.strip()
+        if not stripped:
+            return "+", ""
+
+        first = stripped[0]
+
+        if first == "-":
+            body = stripped[1:].lstrip()
+            if body:
+                return "-", body
+        elif first == "+":
+            body = stripped[1:].lstrip()
+            if body:
+                return "+", body
+
+        return "+", stripped
+
+    @classmethod
+    def _apply_negation(cls, text):
+        """
+        Return the negation of a LaTeX fragment, folding a leading sign
+        when possible.
+
+        EXAMPLES
+            "100"                →  "-100"
+            "-100"               →  "100"
+            "j"                  →  "-j"
+            "-j"                 →  "j"
+            "\\left(-1\\right)"  →  "-\\left(-1\\right)"
+
+        NOTE: We fold only a top-level leading sign. A `\\left(...)`
+        block keeps its leading "-" untouched (unless it is the whole
+        fragment, in which case we still just prepend another "-").
+        That keeps `-(-1)` visible as such rather than silently
+        simplifying to `1`, which could confuse a reader who is
+        checking the symbolic derivation.
+        """
+        sign, body = cls._strip_leading_sign(text)
+
+        if not body:
+            return "-"
+
+        if sign == "-":
+            return body
+
+        return f"-{body}"
+
+    @staticmethod
+    def _needs_parens_after_cdot(text):
+        """
+        Decide whether a factor must be wrapped in `\\left(...\\right)`
+        when it appears after a `\\cdot`.
+
+        WHY THIS EXISTS
+            `a \\cdot -b` renders as `a · − b` — LaTeX treats the
+            leading "-" of the right operand as a *binary* minus, so
+            the product looks like a subtraction with a stray factor.
+            `a \\cdot \\left(-b\\right)` is unambiguous.
+
+        We only wrap when:
+          * the fragment starts with a bare "-" (top level), AND
+          * it is not already parenthesized with `\\left(`.
+
+        Examples:
+            "502,04"               →  False
+            "-j"                   →  True
+            "-502,04j"             →  True
+            "-\\frac{1}{2}"        →  True
+            "\\left(-1\\right)"    →  False  (already protected)
+            "1\\angle84^\\circ"    →  False  (angle fragments never
+                                             need parens)
+        """
+        stripped = text.strip()
+        if not stripped:
+            return False
+
+        if stripped.startswith(r"\left("):
+            return False
+
+        return stripped.startswith("-")
+
+    # -------------------------------------------------------------------
     # Detection of complex-exponential notation (∠ in exponent form)
     # -------------------------------------------------------------------
 
@@ -838,9 +1040,35 @@ class MathcadParser:
 
         return False
 
+    # -------------------------------------------------------------------
+    # Extraction of the polar angle from `e^(j·deg·φ)`
+    # -------------------------------------------------------------------
+
+    @classmethod
+    def _is_i_times_deg_operand(cls, operand):
+        """
+        Helper: does this operand look like `1j·deg` (imag × deg)?
+        """
+        parts = list(operand)
+
+        if not parts:
+            return False
+
+        if cls.strip_ns(parts[0].tag) != "mult":
+            return False
+
+        factors = parts[1:]
+
+        has_imag = any(
+            cls.strip_ns(p.tag) == "imag" for p in factors
+        )
+        has_deg = any(cls.is_degree_unit(p) for p in factors)
+
+        return has_imag and has_deg
+
     @classmethod
     def extract_polar_angle_degrees(cls, node):
-        """
+        r"""
         Recognize the exponent form `1j·deg·φ` and return the LaTeX for φ.
 
         WHY THIS EXISTS
@@ -885,35 +1113,11 @@ class MathcadParser:
         if len(operands) < 2:
             return None
 
-        def operand_is_i_times_deg(operand):
-            """
-            Helper: is the operand `1j·deg` (imag × deg)?
-            """
-            parts = list(operand)
-
-            if not parts:
-                return False
-
-            if cls.strip_ns(parts[0].tag) != "mult":
-                return False
-
-            factors = parts[1:]
-
-            has_imag = any(
-                cls.strip_ns(p.tag) == "imag" for p in factors
-            )
-
-            has_deg = any(
-                cls.is_degree_unit(p) for p in factors
-            )
-
-            return has_imag and has_deg
-
         i_deg_found = False
         angle_parts = []
 
         for operand in operands:
-            if operand_is_i_times_deg(operand):
+            if cls._is_i_times_deg_operand(operand):
                 if i_deg_found:
                     # More than one `j·deg` factor — unusual, bail out.
                     return None
@@ -934,6 +1138,66 @@ class MathcadParser:
         return " \\cdot ".join(angle_parts)
 
     @classmethod
+    def extract_polar_angle_numeric(cls, node):
+        """
+        Same shape as `extract_polar_angle_degrees`, but returns the
+        numeric value of the angle as a float, or None if the angle is
+        not a simple numeric constant.
+
+        Used by the `pow` handler when `_explicit_all_mode` is set and
+        we want to decide whether the angle is on-axis. Non-numeric
+        angles (e.g. `e^(j·deg·x)`) return None and fall back to the
+        normal polar rendering.
+        """
+        if node is None:
+            return None
+
+        children = list(node)
+
+        if not children:
+            return None
+
+        op = cls.strip_ns(children[0].tag)
+
+        if op != "mult":
+            return None
+
+        operands = children[1:]
+
+        if len(operands) < 2:
+            return None
+
+        i_deg_found = False
+        numeric_value = 1.0
+        numeric_count = 0
+
+        for operand in operands:
+            if cls._is_i_times_deg_operand(operand):
+                if i_deg_found:
+                    return None
+                i_deg_found = True
+                continue
+
+            tag = cls.strip_ns(operand.tag)
+
+            if tag != "real":
+                # Non-numeric factor in the exponent — bail out.
+                return None
+
+            try:
+                numeric_value *= float(
+                    (operand.text or "0").strip()
+                )
+                numeric_count += 1
+            except (ValueError, TypeError):
+                return None
+
+        if not i_deg_found or numeric_count == 0:
+            return None
+
+        return numeric_value
+
+    @classmethod
     def format_angle_symbol(cls, angle_latex):
         r"""
         Wrap an angle in the LaTeX angle marker: \angle φ°.
@@ -945,6 +1209,39 @@ class MathcadParser:
             return r"\angle^{\circ}"
 
         return rf"\angle{angle_latex}^{{\circ}}"
+
+    @classmethod
+    def angle_to_rectangular(cls, angle_deg):
+        """
+        Convert an on-axis angle (in degrees) to its rectangular
+        representation as a short LaTeX fragment.
+
+        Returns None for off-axis angles, so the caller can fall back
+        to the polar form. Returns a string for on-axis angles:
+
+            0°      → "1"
+            ±180°   → "-1"
+            90°     → symbol (j by default)
+            -90°    → "-" + symbol
+
+        Used only in explicit-ALL mode (see module-level note).
+        """
+        normalized = cls.normalize_angle_degrees(angle_deg)
+        symbol = cls.IMAGINARY_SYMBOL
+
+        if math.isclose(normalized, 0.0, abs_tol=1e-9):
+            return "1"
+
+        if math.isclose(abs(normalized), 180.0, abs_tol=1e-9):
+            return "-1"
+
+        if math.isclose(normalized, 90.0, abs_tol=1e-9):
+            return symbol
+
+        if math.isclose(normalized, -90.0, abs_tol=1e-9):
+            return f"-{symbol}"
+
+        return None
 
     @classmethod
     def parse_complex_node(cls, node):
@@ -1063,6 +1360,12 @@ class MathcadParser:
             '+', '-', '=', '(', '{', '[', or '·') — there is no
             coefficient. Add "1" so the reader sees `1∠φ°`.
 
+        NOTE: This is the *last-resort* check, applied at the outermost
+        frames (root handlers). In the common `mult` path the "1" is
+        already inserted by `_process_mult_angle_args` before the
+        assembled string reaches `restore_angle_symbols`, so the
+        preceding character is a digit and no double prefix occurs.
+
         Example cases:
           "0,9987 + "   → last char is space → add "1"
           "\\frac{1}{"  → last char is '{' → add "1"
@@ -1089,8 +1392,13 @@ class MathcadParser:
         \angle... LaTeX, inserting a leading "1" modulus when the
         surrounding context lacks a coefficient.
 
-        NOTE: This is THE single place where the implicit-unity rule
-        is enforced. All earlier stages just emit opaque placeholders.
+        NOTE: This is the final place where the implicit-unity rule
+        is enforced. In the common `mult` path, the "1" is already
+        inserted by `_process_mult_angle_args` (so `before_text`
+        ends with a digit and no extra "1" is added here). The check
+        is still needed for angles that were not assembled through
+        the mult handler, e.g. a bare `e^(j·deg·120°)` at the top
+        level of a define.
         """
         for mark, angle_latex in marks.items():
             while mark in text:
@@ -1251,10 +1559,34 @@ class MathcadParser:
         return False
 
     @staticmethod
-    def _ends_with_digit(text):
-        """True if `text` ends with a digit (looking past trailing braces/spaces)."""
-        stripped = text.strip().rstrip("} \t")
-        return bool(stripped) and stripped[-1].isdigit()
+    def _try_parse_number(text):
+        """
+        Try to parse a plain decimal number written with a comma decimal
+        separator (as `format_num` emits). Returns a float, or None.
+        """
+        stripped = text.strip()
+        if not re.fullmatch(r"[+-]?\d+(?:,\d+)?", stripped):
+            return None
+        try:
+            return float(stripped.replace(",", "."))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _format_number(value):
+        """
+        Inverse of `_try_parse_number`. Returns a string with comma
+        decimal separator, or None if the value cannot be represented
+        in plain (non-scientific) form.
+        """
+        if value == int(value) and abs(value) < 1e15:
+            return str(int(value))
+
+        text = f"{value:.10g}"
+        if "e" in text.lower() or "E" in text:
+            return None
+
+        return text.replace(".", ",")
 
     @classmethod
     def _process_mult_angle_args(cls, args, children):
@@ -1271,11 +1603,20 @@ class MathcadParser:
         This function:
           1. Merges the explicit `1` in `1 · ∠120°` so we don't emit
              "1 · 1∠120°".
-          2. Decides where an implicit `1` modulus is needed (e.g. when
-             an angle is preceded by `+` or `(`).
-          3. Joins everything with `\cdot` — except in the special case
+          2. Decides where an implicit `1` modulus is needed. The rule
+             (see module-level note "IMPORTANT — 1∠ BEFORE AN ANGLE"):
+               - pure number before the angle → no extra "1";
+               - anything else → prepend "1".
+          3. In explicit-ALL mode, additionally merges adjacent pure
+             numeric factors so that, e.g., `100·(-1)` collapses to
+             `-100`.
+          4. Joins everything with `\cdot` — except in the special case
              where a coefficient directly precedes an angle, where the
              implicit product is written juxtaposed.
+          5. Wraps a minus-leading right operand in `\left(...\right)`
+             so the leading "-" is not read as a binary minus. See the
+             module-level note "IMPORTANT — SIGN CLEANUP AROUND
+             OPERATORS".
         """
         n = len(args)
 
@@ -1322,13 +1663,16 @@ class MathcadParser:
 
         # Step 2: decide where an implicit "1" modulus is required.
         #
-        # Cases:
-        #   * nothing before  → add 1
-        #   * pure number before → no (number IS the modulus)
-        #   * identifier before:
-        #       - ends with digit → add 1 (e.g. "Xw1" is not a modulus)
-        #       - otherwise → no
-        #   * any other expression (parens, etc.) → add 1
+        # MATHCAD QUIRK: `X·e^(j·deg·φ)` is really `X·(1∠φ°)`.
+        # When `X` is a pure number it doubles as the modulus of the
+        # polar form and we can write `X∠φ°` directly. When `X` is
+        # anything else (a letter variable, a subscripted identifier,
+        # a parenthesized expression, or nothing at all) the modulus
+        # of the polar part is still 1 and must be shown explicitly:
+        # `X·1∠φ°`.
+        #
+        # The rule therefore is binary: pure number → no prefix,
+        # otherwise → prefix "1".
         for i, f in enumerate(factors):
             if not f["is_angle"] or f["has_one_angle"]:
                 continue
@@ -1345,18 +1689,58 @@ class MathcadParser:
                 break
 
             if prev_idx == -1:
+                # Nothing before the angle in this mult chain.
                 f["prefix_one"] = True
                 continue
 
             prev_text = factors[prev_idx]["text"].strip()
 
             if cls._is_pure_number_latex(prev_text):
-                pass
-            elif cls._is_simple_coefficient(prev_text):
-                if cls._ends_with_digit(prev_text):
-                    f["prefix_one"] = True
-            else:
-                f["prefix_one"] = True
+                # The number itself is the modulus — no "1".
+                continue
+
+            # Anything else needs the explicit "1" modulus.
+            f["prefix_one"] = True
+
+        # Step 2.5 (explicit-ALL only): merge adjacent pure-numeric
+        # factors. In explicit-ALL mode on-axis angles are rendered as
+        # plain numbers (see the module-level note), so a product like
+        # `100·e^(j·180°)` becomes [100, "-1"]. Joining those with a
+        # `\cdot` would give the awkward `100 \cdot -1`; multiplying
+        # them gives the natural `-100`.
+        if cls._explicit_all_mode:
+            i = 0
+            while i < len(factors) - 1:
+                if not factors[i]["keep"]:
+                    i += 1
+                    continue
+
+                a = cls._try_parse_number(factors[i]["text"])
+                if a is None:
+                    i += 1
+                    continue
+
+                # Find the next kept factor.
+                j = i + 1
+                while j < len(factors) and not factors[j]["keep"]:
+                    j += 1
+                if j >= len(factors):
+                    break
+
+                b = cls._try_parse_number(factors[j]["text"])
+                if b is None:
+                    i += 1
+                    continue
+
+                product_text = cls._format_number(a * b)
+                if product_text is None:
+                    i += 1
+                    continue
+
+                factors[i]["text"] = product_text
+                factors[i]["is_pure_number"] = True
+                factors[j]["keep"] = False
+                i += 1
 
         # Step 3: assemble the final string.
         parts = []
@@ -1371,20 +1755,27 @@ class MathcadParser:
         result = ""
         for text, f in parts:
             if not result:
+                # First factor: even a leading "-" is fine at the
+                # start of an expression.
                 result = text
                 continue
 
             # If the current piece is a bare angle mark and the previous
             # piece is a simple coefficient, juxtapose them (a·∠x →
             # a∠x). Otherwise insert an explicit \cdot.
-            if cls._is_bare_angle_mark(text):
-                prev_clean = result.strip()
-                if cls._is_simple_coefficient(prev_clean):
-                    result += text
-                else:
-                    result += f" \\cdot {text}"
-            else:
-                result += f" \\cdot {text}"
+            if (cls._is_bare_angle_mark(text)
+                    and cls._is_simple_coefficient(result.strip())):
+                result += text
+                continue
+
+            # Wrap a minus-leading right operand: `a \cdot -b` would
+            # render with a dangling binary minus. `a \cdot (-b)` is
+            # unambiguous. See module-level note "IMPORTANT — SIGN
+            # CLEANUP AROUND OPERATORS".
+            if cls._needs_parens_after_cdot(text):
+                text = rf"\left({text.strip()}\right)"
+
+            result += f" \\cdot {text}"
 
         return result if result else "1"
 
@@ -1552,8 +1943,8 @@ class MathcadParser:
         NOTE: This is the outermost wrapper. Its only job beyond
         delegating to `parse_node_to_latex` is to flush any lingering
         angle placeholders. Inside recursive parsing we deliberately
-        keep placeholders unresolved so that the parent `mult` /
-        `plus` handlers can see them as opaque tokens.
+        keep placeholders unresolved so that the parent `mult` / `plus`
+        handlers can see them as opaque tokens.
         """
         try:
             latex = cls.parse_node_to_latex(node)
@@ -1790,27 +2181,63 @@ class MathcadParser:
                 )
 
             # ---- addition ----
+            #
+            # SIGN CLEANUP (see module-level note "IMPORTANT — SIGN
+            # CLEANUP AROUND OPERATORS"): a negative right operand
+            # becomes a subtraction instead of `+ -x`. Works for any
+            # number of operands, though Mathcad emits binary plus
+            # in practice.
             if op == "plus":
-                if len(args) > 1:
-                    return f"{args[0]} + {args[1]}"
-                return args[0] if args else ""
+                if not args:
+                    return ""
+
+                result = args[0]
+                for right in args[1:]:
+                    sign, body = cls._strip_leading_sign(right)
+                    if sign == "-":
+                        result = f"{result} - {body}"
+                    else:
+                        result = f"{result} + {right}"
+                return result
 
             # ---- subtraction ----
+            #
+            # SIGN CLEANUP: a negative right operand becomes an
+            # addition instead of `- -x`.
             if op == "minus":
-                if len(args) > 1:
-                    return f"{args[0]} - {args[1]}"
-                return f"-{args[0]}" if args else "-"
+                if not args:
+                    return "-"
+
+                if len(args) == 1:
+                    # Unary minus.
+                    return cls._apply_negation(args[0])
+
+                result = args[0]
+                for right in args[1:]:
+                    sign, body = cls._strip_leading_sign(right)
+                    if sign == "-":
+                        result = f"{result} + {body}"
+                    else:
+                        result = f"{result} - {right}"
+                return result
 
             # ---- unary negation ----
             # MATHCAD QUIRK: Mathcad sometimes nests a long chain of
             # <neg/> around a placeholder (visible in empty-input
-            # regions). We render the outermost minus and recurse.
+            # regions). We render the outermost minus and fold any
+            # nested leading sign.
             if op == "neg":
-                return f"-{args[0]}" if args else "-"
+                if not args:
+                    return "-"
+                return cls._apply_negation(args[0])
 
             # ---- exponentiation ----
             # Intercepts e^(j·deg·φ) and produces an angle mark; other
             # powers fall through to plain `{base}^{exp}`.
+            #
+            # In explicit-ALL mode (see module-level note), on-axis
+            # angles (0°, ±90°, 180°) are converted directly to their
+            # rectangular form, bypassing the angle-mark machinery.
             if op == "pow":
                 base_node = (
                     children[1] if len(children) > 1 else None
@@ -1824,6 +2251,18 @@ class MathcadParser:
                         exp_node
                     )
                     if angle_latex is not None:
+                        if cls._explicit_all_mode:
+                            angle_value = (
+                                cls.extract_polar_angle_numeric(
+                                    exp_node
+                                )
+                            )
+                            if angle_value is not None:
+                                rect = cls.angle_to_rectangular(
+                                    angle_value
+                                )
+                                if rect is not None:
+                                    return rect
                         return cls.push_angle_mark(
                             cls.format_angle_symbol(angle_latex)
                         )
@@ -1956,6 +2395,32 @@ class MathcadParser:
     # -------------------------------------------------------------------
 
     @classmethod
+    def _sym_eval_uses_explicit_all(cls, sym_eval_node):
+        """
+        Return True if the given <symEval> contains a `<command>` whose
+        text mentions both `explicit` and `ALL`.
+
+        Used to enable the on-axis-rectangular rule (see module-level
+        note "IMPORTANT — EXPLICIT ALL AND ON-AXIS ANGLES").
+        """
+        if sym_eval_node is None:
+            return False
+
+        command_node = None
+        for child in sym_eval_node:
+            if cls.strip_ns(child.tag) == "command":
+                command_node = child
+                break
+
+        if command_node is None:
+            return False
+
+        text = " ".join(command_node.itertext())
+        tokens = text.split()
+
+        return "explicit" in tokens and "ALL" in tokens
+
+    @classmethod
     def parse_eval_to_latex_root(cls, node):
         """
         Entry point for `<eval>` regions (numeric or symbolic evaluation).
@@ -1996,6 +2461,16 @@ class MathcadParser:
 
         The output uses "=" between stages so the reader can follow the
         chain: input expression → symbolic intermediate → final value.
+
+        IMPORTANT — EXPLICIT ALL
+        ------------------------
+        When the symbolic part of the evaluation was driven by
+        `explicit ALL`, we flip `_explicit_all_mode` for the duration
+        of the `<symResult>` parse. In that mode the `pow` handler
+        emits rectangular numbers for on-axis angles instead of
+        polar forms. The flag is saved and restored so nested calls
+        do not leak (see module-level note "IMPORTANT — EXPLICIT
+        ALL AND ON-AXIS ANGLES").
         """
         result_node = cls.find_first_by_tag(node, "result")
         sym_eval_node = cls.find_first_by_tag(node, "symEval")
@@ -2025,9 +2500,20 @@ class MathcadParser:
                     parts.append(expression_latex)
 
             if sym_result_node is not None:
-                sym_result_latex = cls.parse_node_to_latex(
-                    sym_result_node
+                # Detect `explicit ALL` and toggle the mode only for
+                # the symResult parse.
+                uses_explicit_all = cls._sym_eval_uses_explicit_all(
+                    sym_eval_node
                 )
+                saved_mode = cls._explicit_all_mode
+                cls._explicit_all_mode = uses_explicit_all
+                try:
+                    sym_result_latex = cls.parse_node_to_latex(
+                        sym_result_node
+                    )
+                finally:
+                    cls._explicit_all_mode = saved_mode
+
                 if sym_result_latex:
                     parts.append(sym_result_latex)
 
