@@ -26,11 +26,9 @@ class MathcadParser:
     # Количество знаков после запятой для угла в полярной форме.
     ANGLE_DECIMALS = 1
 
-    # Режим вывода комплексных чисел:
-    #   True  — переводить a + ib в полярную форму |z|∠φ°;
-    #   False — оставлять в декартовой форме a + ib.
-    # На замену e^(1j·deg·φ) → ∠φ° НЕ влияет.
-    complex_to_polar = True
+    # Порог научной формы: если модуль числа < 10^sci_threshold,
+    # число выводится как m \cdot 10^n. None — отключено.
+    sci_threshold = None
 
     @staticmethod
     def strip_ns(tag):
@@ -39,6 +37,68 @@ class MathcadParser:
             return tag.split("}", 1)[1]
 
         return tag
+
+    @classmethod
+    def _compute_target_sig_figs(cls, abs_value):
+        """Определяет целевое число значащих цифр для значения."""
+        if abs_value >= 1:
+            int_digits = len(str(int(abs_value)))
+            base_sig_figs = max(
+                cls.sig_figs_small,
+                min(cls.sig_figs_large, int_digits)
+            )
+        else:
+            base_sig_figs = cls.sig_figs_small
+
+        sci_str = f"{abs_value:.15e}"
+        first_digit = sci_str[0]
+
+        if first_digit in ("1", "2"):
+            return base_sig_figs + 1
+
+        return base_sig_figs
+
+    @classmethod
+    def format_scientific(cls, value, sig_figs):
+        r"""
+        Форматирует число в научной форме:
+
+            m \cdot 10^{n}
+
+        где m — мантисса с заданным числом значащих цифр,
+        разделитель — запятая.
+        """
+        if value == 0:
+            return "0"
+
+        sign = "-" if value < 0 else ""
+        abs_value = abs(value)
+
+        decimals = max(sig_figs - 1, 0)
+
+        sci_str = f"{abs_value:.{decimals}e}"
+        mantissa_part, exp_part = sci_str.split("e")
+        exponent = int(exp_part)
+        mantissa_str = mantissa_part
+
+        # Убираем незначащие нули.
+        if "." in mantissa_str:
+            mantissa_str = (
+                mantissa_str.rstrip("0").rstrip(".")
+            )
+
+        if not mantissa_str:
+            mantissa_str = "0"
+
+        mantissa_str = mantissa_str.replace(".", ",")
+
+        if exponent == 0:
+            return sign + mantissa_str
+
+        return (
+            rf"{sign}{mantissa_str}"
+            rf" \cdot 10^{{{exponent}}}"
+        )
 
     @classmethod
     def format_num(cls, num_str):
@@ -54,23 +114,21 @@ class MathcadParser:
 
             abs_value = abs(value)
 
-            sci_str = f"{abs_value:.15e}"
-            first_digit = sci_str[0]
+            # Проверяем порог научной формы.
+            if cls.sci_threshold is not None:
+                threshold = 10.0 ** cls.sci_threshold
 
-            if abs_value >= 1:
-                int_digits = len(str(int(abs_value)))
+                if abs_value < threshold:
+                    target_sig_figs = cls._compute_target_sig_figs(
+                        abs_value
+                    )
+                    return cls.format_scientific(
+                        value, target_sig_figs
+                    )
 
-                base_sig_figs = max(
-                    cls.sig_figs_small,
-                    min(cls.sig_figs_large, int_digits)
-                )
-            else:
-                base_sig_figs = cls.sig_figs_small
-
-            if first_digit in ("1", "2"):
-                target_sig_figs = base_sig_figs + 1
-            else:
-                target_sig_figs = base_sig_figs
+            target_sig_figs = cls._compute_target_sig_figs(
+                abs_value
+            )
 
             formatted = f"{value:.{target_sig_figs}g}"
 
@@ -104,6 +162,7 @@ class MathcadParser:
         except (ValueError, TypeError):
             return str(angle).replace(".", ",")
 
+        # Убираем "минус ноль".
         if math.isclose(value, 0.0, abs_tol=1e-12):
             value = 0.0
 
@@ -280,64 +339,26 @@ class MathcadParser:
         return (node.attrib.get("symbol") or "i").strip() or "i"
 
     @classmethod
-    def format_complex_cartesian(cls, real_value, imag_value, imag_symbol="i"):
-        """
-        Возвращает декартову запись комплексного числа:
-        a + bi, a - bi, -bi, a.
-        """
-        try:
-            real_f = float(real_value)
-            imag_f = float(imag_value)
-        except (ValueError, TypeError):
-            real_text = cls.format_num(str(real_value))
-            imag_text = cls.format_num(str(imag_value))
-            sign = "" if imag_text.startswith("-") else "+"
-            return f"{real_text}{sign}{imag_text}{imag_symbol}"
-
-        real_zero = math.isclose(real_f, 0.0, abs_tol=1e-12)
-        imag_zero = math.isclose(imag_f, 0.0, abs_tol=1e-12)
-
-        real_text = cls.format_num(str(real_f))
-        imag_text = cls.format_num(str(imag_f))
-
-        if imag_zero:
-            return real_text
-
-        if real_zero:
-            if imag_f < 0:
-                return f"-{imag_text.lstrip('-')}{imag_symbol}"
-            return f"{imag_text}{imag_symbol}"
-
-        if imag_f < 0:
-            return f"{real_text} - {imag_text.lstrip('-')}{imag_symbol}"
-
-        return f"{real_text} + {imag_text}{imag_symbol}"
-
-    @classmethod
     def parse_complex(cls, real_value, imag_value, imag_symbol="i"):
         """
-        Обрабатывает комплексное число.
-
-        При cls.complex_to_polar == True:
-            a + jb -> |z|∠угол°
-
-        При cls.complex_to_polar == False:
-            a + jb -> a + jb (декартова форма)
+        Преобразует a + jb в |z|∠угол°.
         """
-        if not cls.complex_to_polar:
-            return cls.format_complex_cartesian(
-                real_value, imag_value, imag_symbol
-            )
-
         try:
             modulus, angle = cls.calculate_complex_polar(
                 real_value, imag_value
             )
 
         except (ValueError, TypeError):
-            return cls.format_complex_cartesian(
-                real_value, imag_value, imag_symbol
+            real_text = cls.format_num(str(real_value))
+            imag_text = cls.format_num(str(imag_value))
+
+            sign = (
+                ""
+                if imag_text.startswith("-")
+                else "+"
             )
+
+            return f"{real_text}{sign}{imag_text}{imag_symbol}"
 
         modulus_text = cls.format_num(str(modulus))
         angle_text = cls.format_angle_value(angle)
@@ -983,7 +1004,7 @@ class MathcadParser:
             op_node = children[0]
             op = cls.strip_ns(op_node.tag)
 
-            # ---- a + ib ----
+            # ---- a + ib → полярная форма ----
             if op == "plus" and len(children) >= 3:
                 first_node = children[1]
                 second_node = children[2]
@@ -1004,7 +1025,7 @@ class MathcadParser:
                         real_value, imag_value, imag_symbol
                     )
 
-            # ---- a - ib ----
+            # ---- a - ib → полярная форма ----
             if op == "minus" and len(children) >= 3:
                 first_node = children[1]
                 second_node = children[2]
@@ -1430,7 +1451,7 @@ class ConverterApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Mathcad to Word Converter (со стилями)")
-        self.root.geometry("620x720")
+        self.root.geometry("600x780")
         self.root.configure(padx=20, pady=20)
 
         self.input_file = None
@@ -1497,10 +1518,9 @@ class ConverterApp:
                 font=("Segoe UI", 8, "italic")
             ).pack(side=tk.BOTTOM, pady=5)
 
-        # ---------- Настройки ----------
         frame_settings = ttk.LabelFrame(
             self.root,
-            text="Настройки вывода",
+            text="Настройки округления (значащие цифры)",
             padding=10
         )
         frame_settings.pack(fill=tk.X, pady=(0, 15))
@@ -1510,7 +1530,7 @@ class ConverterApp:
 
         ttk.Label(
             frame_settings,
-            text="Малые числа и дроби (значащих цифр):"
+            text="Для малых чисел и дробей (по умолчанию 4):"
         ).grid(row=0, column=0, sticky=tk.W, pady=2)
 
         ttk.Spinbox(
@@ -1520,7 +1540,7 @@ class ConverterApp:
 
         ttk.Label(
             frame_settings,
-            text="Большие числа (значащих цифр):"
+            text="Для больших чисел (по умолчанию 8):"
         ).grid(row=1, column=0, sticky=tk.W, pady=2)
 
         ttk.Spinbox(
@@ -1528,42 +1548,54 @@ class ConverterApp:
             textvariable=self.sig_figs_large_var, width=5
         ).grid(row=1, column=1, sticky=tk.W, padx=10, pady=2)
 
-        ttk.Separator(
-            frame_settings, orient=tk.HORIZONTAL
-        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=8)
+        # --- Научная форма для малых чисел ---
 
-        # Выбор формы комплексных чисел.
+        ttk.Separator(
+            frame_settings, orient="horizontal"
+        ).grid(
+            row=2, column=0, columnspan=2,
+            sticky="ew", pady=(8, 6)
+        )
+
+        self.use_sci_var = tk.BooleanVar(value=False)
+
+        ttk.Checkbutton(
+            frame_settings,
+            text="Научная форма для малых чисел",
+            variable=self.use_sci_var,
+            command=self.toggle_sci
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=2)
+
         ttk.Label(
             frame_settings,
-            text="Форма комплексных чисел:"
-        ).grid(row=3, column=0, sticky=tk.W, pady=(0, 4))
+            text="Порог 10^N (например -4):"
+        ).grid(row=4, column=0, sticky=tk.W, pady=2)
 
-        self.complex_form_var = tk.StringVar(value="polar")
-
-        ttk.Radiobutton(
-            frame_settings,
-            text="Полярная ( |z|∠φ° )",
-            variable=self.complex_form_var,
-            value="polar"
-        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=1)
-
-        ttk.Radiobutton(
-            frame_settings,
-            text="Декартова ( a + ib )",
-            variable=self.complex_form_var,
-            value="cartesian"
-        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=1)
+        self.sci_threshold_var = tk.IntVar(value=-4)
+        self.sci_spinbox = ttk.Spinbox(
+            frame_settings, from_=-15, to=0,
+            textvariable=self.sci_threshold_var, width=5
+        )
+        self.sci_spinbox.grid(
+            row=4, column=1, sticky=tk.W, padx=10, pady=2
+        )
+        self.sci_spinbox.config(state="disabled")
 
         ttk.Label(
             frame_settings,
             text=(
-                "Не влияет на замену e^(1j·deg·φ) → ∠φ°"
+                "Числа с модулем меньше 10^N выводятся в виде "
+                "m·10^k, например 6,344·10^-6."
             ),
             font=("Segoe UI", 8, "italic"),
-            foreground="gray"
-        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+            foreground="gray",
+            wraplength=520,
+            justify=tk.LEFT
+        ).grid(
+            row=5, column=0, columnspan=2,
+            sticky=tk.W, pady=(4, 0)
+        )
 
-        # ---------- Шаблон ----------
         frame_template = ttk.LabelFrame(
             self.root,
             text="Шаблон стилей Word (.docx)",
@@ -1583,7 +1615,6 @@ class ConverterApp:
             command=self.browse_template
         ).pack(side=tk.RIGHT, padx=5)
 
-        # ---------- Кнопка ----------
         self.btn_convert = ttk.Button(
             self.root,
             text="Конвертировать и сохранить как...",
@@ -1592,7 +1623,6 @@ class ConverterApp:
         )
         self.btn_convert.pack(fill=tk.X, pady=10, ipady=5)
 
-        # ---------- Лог ----------
         frame_log = ttk.LabelFrame(
             self.root, text="Статус и Логи", padding=5
         )
@@ -1608,6 +1638,12 @@ class ConverterApp:
         self.root.after(
             500,
             lambda: WordConverter.check_pandoc(self.log)
+        )
+
+    def toggle_sci(self):
+        """Включает/выключает поле порога научной формы."""
+        self.sci_spinbox.config(
+            state="normal" if self.use_sci_var.get() else "disabled"
         )
 
     def log(self, message):
@@ -1721,22 +1757,21 @@ class ConverterApp:
             MathcadParser.sig_figs_small = 4
             MathcadParser.sig_figs_large = 8
 
-        # Режим формы комплексных чисел.
-        try:
-            complex_form = self.complex_form_var.get()
-        except Exception:
-            complex_form = "polar"
+        if self.use_sci_var.get():
+            try:
+                threshold = int(self.sci_threshold_var.get())
+            except Exception:
+                threshold = -4
 
-        MathcadParser.complex_to_polar = (complex_form == "polar")
-
-        self.log(
-            "[INFO] Форма комплексных чисел: "
-            + (
-                "полярная ( |z|∠φ° )"
-                if MathcadParser.complex_to_polar
-                else "декартова ( a + ib )"
+            MathcadParser.sci_threshold = threshold
+            self.log(
+                "[INFO] Научная форма включена: "
+                f"числа с модулем < 10^{threshold} "
+                "будут выводиться в виде m·10^k"
             )
-        )
+        else:
+            MathcadParser.sci_threshold = None
+            self.log("[INFO] Научная форма отключена")
 
         self.log("[INFO] Парсинг XML файла Mathcad...")
 
