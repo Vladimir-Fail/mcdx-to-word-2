@@ -16,7 +16,7 @@ inline as `NOTE:` blocks. Whenever you touch a parser branch, please
 add a short NOTE explaining the specific Mathcad construct it handles.
 Every quirk encoded below was observed in real .xmcd files (14.1).
 
-Big-picture pipeline:
+Pipeline:
 
     .xmcd (XML)  --[MathcadParser.process_file]-->  Markdown+LaTeX
     Markdown+LaTeX  --[WordConverter.convert_to_word]-->  .docx
@@ -67,9 +67,9 @@ class MathcadParser:
 
     NOTE (region ordering):
         Regions are laid out on a 2D canvas. Each `<region>` has a `top`
-        attribute (float, in points). We sort by `top` to reconstruct the
-        visual reading order. Column (`left`) is ignored because Mathcad
-        users usually write top-to-bottom.
+        attribute (float, in points). We sort by `top` to reconstruct
+        the visual reading order. Column (`left`) is ignored because
+        Mathcad users usually write top-to-bottom.
     """
 
     # Numeric formatting knobs (overridable from the GUI).
@@ -77,12 +77,56 @@ class MathcadParser:
     sig_figs_large = 8
 
     # Number of decimal places for angles in polar form.
-    # Mathcad itself prints angles with 15+ digits; we round for readability.
     ANGLE_DECIMALS = 1
 
     # Scientific-notation threshold: numbers with |x| < 10^sci_threshold
     # are rendered as "m·10^k". `None` disables the feature.
     sci_threshold = None
+
+    # -------------------------------------------------------------------
+    # Angle-mark machinery (deferred ∠ substitution)
+    # -------------------------------------------------------------------
+    #
+    # WHY THIS EXISTS
+    # ---------------
+    # When we encounter an exponent `e^(j·deg·φ)`, we want to emit
+    # `∠φ°`. But the parent `mult` handler still needs to see the
+    # result as an opaque *operand* — it inserts an implicit "1"
+    # modulus depending on what precedes the angle. If we emitted raw
+    # LaTeX with `\angle` immediately, the mult handler would try to
+    # reformat it and the "is this a coefficient?" logic would misfire.
+    #
+    # The placeholder approach:
+    #   1. `push_angle_mark()` returns a token "@@ANGLEn@@" with no
+    #      LaTeX special characters. It survives any string concat
+    #      and comparison safely.
+    #   2. At the outermost parse frame (parse_node_to_latex_root /
+    #      parse_eval_to_latex_root) we call `pop_all_angle_marks()`
+    #      and substitute every token for its real `\angle...` LaTeX,
+    #      inserting an implicit "1" when no coefficient precedes.
+    #
+    # IMPORTANT INVARIANT
+    # -------------------
+    # Only the `mult` branch may pop marks, and it must pop ONLY the
+    # marks pushed during ITS OWN argument parsing. Marks pushed by
+    # sibling branches (e.g. the numerator of a fraction) must stay on
+    # the stack until the outer frame resolves them.
+    #
+    # Bug history: an earlier version called `pop_all_angle_marks()`
+    # inside `mult`, which stole sibling marks — e.g. `pow(e, i·deg·84)`
+    # (numerator) had its mark swallowed by the `mult` inside
+    # `pow(e, i·deg·78)` (denominator of a sibling fraction). Result:
+    # one angle rendered as `1∠84°`, the other as raw `@@ANGLE3@@`.
+    # `pop_angle_marks_since(depth)` fixes this.
+
+    # Regex matching "@@ANGLE0@@", "@@ANGLE1@@", ...
+    ANGLE_MARK_RE = re.compile(r"@@ANGLE\d+@@")
+
+    # Stack of active marks. Each entry is a single-key dict.
+    _angle_mark_stack = []
+
+    # Monotonic counter so nested marks never collide.
+    _angle_mark_counter = 0
 
     # -------------------------------------------------------------------
     # Low-level helpers
@@ -121,6 +165,18 @@ class MathcadParser:
                 return child
 
         return None
+
+    @classmethod
+    def _angle_stack_depth(cls):
+        """
+        Current number of stacked angle marks.
+
+        NOTE: We measure this BEFORE parsing any arguments so that a
+        `mult` handler can distinguish "marks pushed by my operands"
+        (depth >= this value) from "marks pushed by sibling branches"
+        (depth <  this value, must not be touched).
+        """
+        return len(cls._angle_mark_stack)
 
     # -------------------------------------------------------------------
     # Numeric formatting
@@ -731,40 +787,16 @@ class MathcadParser:
         )
 
     # -------------------------------------------------------------------
-    # Angle-mark machinery (deferred ∠ substitution)
+    # Angle-mark stack management
     # -------------------------------------------------------------------
-
-    # Placeholder regex: matches "@@ANGLE0@@", "@@ANGLE1@@", etc.
-    ANGLE_MARK_RE = re.compile(r"@@ANGLE\d+@@")
-
-    # Stack of currently-active marks (a list of one-key dicts).
-    _angle_mark_stack = []
-
-    # Monotonic counter so nested angles never collide.
-    _angle_mark_counter = 0
 
     @classmethod
     def push_angle_mark(cls, latex):
         r"""
         Hide a ready-made LaTeX angle (e.g. \angle 84^\circ) inside a
-        placeholder token "@@ANGLEn@@".
+        placeholder token "@@ANGLEn@@" and return that token.
 
-        WHY THIS IS NEEDED
-        ------------------
-        When we encounter an exponent `e^(j·deg·84)`, we want to emit
-        `∠84°`. But the parent `mult` handler still needs to see the
-        result as an opaque *operand* — it does things like "insert 1
-        before an angle if no coefficient is present". If we emitted
-        raw LaTeX with an angle symbol, the mult handler would try to
-        parse and reformat it.
-
-        The placeholder approach:
-          1. Emit a token "@@ANGLEn@@" that contains no LaTeX special
-             characters. It survives any string manipulation safely.
-          2. When the outermost parser frame completes, walk the final
-             string and substitute every placeholder for the real
-             angle LaTeX — inserting an implicit "1" modulus when no
-             numeric coefficient precedes.
+        WHY THIS IS NEEDED — see the module-level note above.
         """
         mark = f"@@ANGLE{cls._angle_mark_counter}@@"
         cls._angle_mark_counter += 1
@@ -772,12 +804,33 @@ class MathcadParser:
         return mark
 
     @classmethod
+    def pop_angle_marks_since(cls, depth):
+        """
+        Pop and return every mark pushed after the given stack depth.
+
+        Marks BELOW `depth` belong to outer frames and must stay on
+        the stack so those frames can resolve them later.
+
+        Returns a flat dict {mark: latex}.
+        """
+        popped = cls._angle_mark_stack[depth:]
+        del cls._angle_mark_stack[depth:]
+
+        merged = {}
+        for marks in popped:
+            merged.update(marks)
+
+        return merged
+
+    @classmethod
     def pop_all_angle_marks(cls):
         """
         Merge and clear every active angle placeholder.
 
-        NOTE: Returns a flat dict {mark: latex} so the caller can
-        perform one pass of substitutions over the final string.
+        Used ONLY by the outermost entry points
+        (parse_node_to_latex_root / parse_eval_to_latex_root).
+
+        Returns a flat dict {mark: latex}.
         """
         merged = {}
 
@@ -832,14 +885,6 @@ class MathcadParser:
         is enforced. All earlier stages just emit opaque placeholders.
         """
         for mark, angle_latex in marks.items():
-            # Special case: the string "\angle@@ANGLEn@@" means the
-            # angle symbol was already emitted alongside the mark.
-            # Collapse it to "1\angle..." regardless of context.
-            bare = rf"\angle{mark}"
-            while bare in text:
-                text = text.replace(bare, rf"1{angle_latex}", 1)
-
-            # Normal placeholder substitution.
             while mark in text:
                 idx = text.find(mark)
                 before = text[:idx]
@@ -932,31 +977,52 @@ class MathcadParser:
     @staticmethod
     def _is_bare_angle_mark(text):
         """
-        True if `text` is an angle mark without surrounding parens.
+        True if `text` is a bare angle mark (unresolved) or a plain
+        resolved angle like "1\\angle 84^\\circ" without extra factors.
 
-        NOTE: This is called on already-processed fragments, so the
-        placeholder token has already been replaced by real LaTeX.
+        NOTE: This is called on already-parsed fragments, so the text
+        may contain:
+          * An unresolved placeholder "@@ANGLEn@@".
+          * A resolved angle without a wrapping parens.
         """
         stripped = text.strip()
+
         if MathcadParser.ANGLE_MARK_RE.fullmatch(stripped):
             return True
-        if re.fullmatch(r"1?\\angle[^()]*", stripped):
+
+        # Resolved angle, no parens, no trailing operators.
+        # Pattern: optional "1", \angle, content without ^\circ going
+        # past it, ends with ^\circ or ^{\circ}.
+        if re.fullmatch(
+            r"1?\\angle.*?\^\s*(?:\\circ|\{\\circ\})",
+            stripped
+        ):
             return True
+
         return False
 
     @staticmethod
     def _is_angle_mark_wrapped(text):
         """
-        True if `text` is an angle fragment, optionally wrapped in parens.
+        True if `text` is an angle fragment (resolved or unresolved),
+        optionally wrapped in \left( ... \right).
+
+        NOTE: The regex is deliberately tight. It must NOT match
+        strings like "1\\angle84^\\circ · x" (angle followed by extra
+        factors), because those are not pure angles.
         """
         stripped = text.strip()
+
         if MathcadParser.ANGLE_MARK_RE.fullmatch(stripped):
             return True
+
         if re.fullmatch(
-            r"(?:\\left\()?1?\\angle[^)]*(?:\\right\))?",
+            r"(?:\\left\()?\s*1?\s*\\angle.*?\^\s*"
+            r"(?:\\circ|\{\\circ\})\s*(?:\\right\))?",
             stripped
         ):
             return True
+
         return False
 
     @staticmethod
@@ -1289,15 +1355,6 @@ class MathcadParser:
         if marks:
             latex = cls.restore_angle_symbols(latex, marks)
 
-        # Safety net: if some nested call leaked a placeholder we clean
-        # it up here.
-        if "@@ANGLE" in latex:
-            extra_marks = cls.pop_all_angle_marks()
-            if extra_marks:
-                latex = cls.restore_angle_symbols(
-                    latex, extra_marks
-                )
-
         return latex
 
     @classmethod
@@ -1380,14 +1437,13 @@ class MathcadParser:
         # where the text content is the coefficient (usually 1) and the
         # attribute carries the letter (i or j). We DROP a coefficient
         # of exactly 1 because `1j` reads awkwardly in LaTeX — the bare
-        # symbol alone is the correct notation.
+        # symbol alone is the correct notation. Same for `-1` → `-j`.
         if tag == "imag":
             symbol = node.attrib.get("symbol", "i")
             raw = node.text.strip() if node.text else ""
             number = cls.format_num(raw)
 
             if not raw or number == "1":
-                # Coeff is 1 (or omitted) → bare imaginary unit.
                 return symbol
             if number == "-1":
                 return f"-{symbol}"
@@ -1468,6 +1524,14 @@ class MathcadParser:
                         real_value, imag_value, imag_symbol
                     )
 
+            # ============================================================
+            # CRITICAL: capture the angle-mark stack depth BEFORE parsing
+            # operands. `mult` will later use this to pop only the marks
+            # pushed by its own arguments — NOT marks owned by sibling
+            # branches (e.g. a numerator whose angle was pushed earlier).
+            # ============================================================
+            depth_before = cls._angle_stack_depth()
+
             # Recursively parse every operand (everything after the op).
             args = [
                 cls.parse_node_to_latex(child)
@@ -1479,9 +1543,12 @@ class MathcadParser:
                 result = cls._process_mult_angle_args(
                     args, children
                 )
-                # Flush angle placeholders introduced by nested pow()
-                # calls (which emit @@ANGLEn@@ tokens).
-                marks_to_restore = cls.pop_all_angle_marks()
+                # Pop ONLY the marks pushed during THIS mult's arg
+                # parsing. Outer marks stay on the stack and will be
+                # resolved by the outer frame's root handler.
+                marks_to_restore = cls.pop_angle_marks_since(
+                    depth_before
+                )
                 return cls.restore_angle_symbols(
                     result, marks_to_restore
                 )
@@ -1671,7 +1738,8 @@ class MathcadParser:
 
         NOTE: Same placeholder-flushing logic as
         `parse_node_to_latex_root` — we need to resolve angle marks
-        before returning to the caller.
+        before returning to the caller. This is the ONLY place where
+        marks left over from a whole `<eval>` subtree get resolved.
         """
         try:
             latex = cls.parse_eval_to_latex(node)
@@ -1680,13 +1748,6 @@ class MathcadParser:
 
         if marks:
             latex = cls.restore_angle_symbols(latex, marks)
-
-        if "@@ANGLE" in latex:
-            extra_marks = cls.pop_all_angle_marks()
-            if extra_marks:
-                latex = cls.restore_angle_symbols(
-                    latex, extra_marks
-                )
 
         return latex
 
@@ -2026,7 +2087,7 @@ class ConverterApp:
                 if filename.lower().endswith(".docx"):
                     return os.path.join(template_dir, filename)
 
-        # Dev fallback: an absolute path that was used during testing.
+        # Dev fallback: an absolute path used during testing.
         fallback_dir = r"C:\VS code здесь\mcdx to word\шаблон"
         if os.path.isdir(fallback_dir):
             for filename in os.listdir(fallback_dir):
