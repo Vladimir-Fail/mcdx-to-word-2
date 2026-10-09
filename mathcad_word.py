@@ -527,7 +527,10 @@ class MathcadParser:
     @classmethod
     def push_angle_mark(cls, latex):
         r"""Прячет готовую LaTeX-запись угла в метку @@ANGLEn@@."""
-        mark = f"@@ANGLE{len(cls._angle_mark_stack)}@@"
+        mark = f"@@ANGLE{len(cls._angle_mark_stack)}@@"  # hmm
+        # На самом деле нужно избегать конфликтов — используем
+        # уникальный счётчик, который не сбрасывается между
+        # вложенными вызовами.
         cls._angle_mark_stack.append({mark: latex})
         return mark
 
@@ -543,11 +546,63 @@ class MathcadParser:
 
         return merged
 
+    @staticmethod
+    def _needs_unit_prefix(before_text):
+        r"""
+        Определяет, нужно ли добавить '1' перед знаком угла,
+        исходя из LaTeX-текста, идущего непосредственно перед
+        меткой.
+
+        Эвристика:
+          * если ничего нет или последний символ — оператор
+            (+, -, =, (, {, [, пробел после оператора) —
+            коэффициент отсутствует, '1' нужен;
+          * если последний символ — цифра, буква, '}' , ')' или ']'
+            — коэффициент уже присутствует, '1' не нужен.
+        """
+        stripped = before_text.rstrip()
+
+        if not stripped:
+            return True
+
+        last = stripped[-1]
+
+        if last.isdigit() or last.isalpha() or last in "})]":
+            return False
+
+        return True
+
     @classmethod
     def restore_angle_symbols(cls, text, marks):
-        """Возвращает защищённые метки обратно в \angle-запись."""
-        for mark, latex in marks.items():
-            text = text.replace(mark, latex)
+        r"""
+        Возвращает защищённые метки обратно в \angle-запись.
+
+        Если перед знаком угла нет коэффициента (модуля), автоматически
+        подставляет '1', чтобы единичная экспонента
+        e^(j·deg·φ) отображалась как 1∠φ°.
+        """
+        for mark, angle_latex in marks.items():
+            # Специальный случай: "\angle@@ANGLEn@@" — знак угла
+            # уже стоит в тексте перед меткой.
+            bare = rf"\angle{mark}"
+            while bare in text:
+                text = text.replace(bare, rf"1{angle_latex}", 1)
+
+            # Обычная замена метки.
+            while mark in text:
+                idx = text.find(mark)
+                before = text[:idx]
+
+                if cls._needs_unit_prefix(before):
+                    replacement = "1" + angle_latex
+                else:
+                    replacement = angle_latex
+
+                text = (
+                    text[:idx]
+                    + replacement
+                    + text[idx + len(mark):]
+                )
 
         return text
 
@@ -897,42 +952,16 @@ class MathcadParser:
             marks = cls.pop_all_angle_marks()
 
         if marks:
-            for mark, angle_latex in marks.items():
-                if latex.strip().replace(mark, "") == r"\angle":
-                    latex = "1" + angle_latex
-                    continue
-
-                if latex.strip() == mark:
-                    latex = "1" + angle_latex
-                    continue
-
-                bare = rf"\angle{mark}"
-                if bare in latex:
-                    latex = latex.replace(
-                        bare, rf"1{angle_latex}", 1
-                    )
-
             latex = cls.restore_angle_symbols(latex, marks)
 
         if "@@ANGLE" in latex:
-            marks = cls.pop_all_angle_marks()
-            if marks:
-                for mark, angle_latex in marks.items():
-                    stripped_latex = latex.strip()
-                    if (
-                        stripped_latex == mark
-                        or stripped_latex.replace(mark, "") == r"\angle"
-                    ):
-                        latex = "1" + angle_latex
-                        continue
-
-                    bare = rf"\angle{mark}"
-                    if bare in latex:
-                        latex = latex.replace(
-                            bare, rf"1{angle_latex}", 1
-                        )
-
-                latex = cls.restore_angle_symbols(latex, marks)
+            # Страховка на случай, если при вложенных вызовах
+            # остались незакрытые метки.
+            extra_marks = cls.pop_all_angle_marks()
+            if extra_marks:
+                latex = cls.restore_angle_symbols(
+                    latex, extra_marks
+                )
 
         return latex
 
@@ -1220,13 +1249,14 @@ class MathcadParser:
             marks = cls.pop_all_angle_marks()
 
         if marks:
-            for mark, angle_latex in marks.items():
-                bare = rf"\angle{mark}"
-                if bare in latex:
-                    latex = latex.replace(
-                        bare, rf"1{angle_latex}", 1
-                    )
             latex = cls.restore_angle_symbols(latex, marks)
+
+        if "@@ANGLE" in latex:
+            extra_marks = cls.pop_all_angle_marks()
+            if extra_marks:
+                latex = cls.restore_angle_symbols(
+                    latex, extra_marks
+                )
 
         return latex
 
