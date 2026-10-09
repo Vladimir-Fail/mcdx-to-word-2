@@ -94,6 +94,42 @@ part only). Angles at other values keep the polar `r∠φ°` form.
 Angles outside `<symResult>` — i.e. in the user's original input
 expression — are NOT affected by this rule.
 
+IMPORTANT — TRAILING-ZERO TRIMMING IN ANGLES
+--------------------------------------------
+Angles in polar-form complex numbers (`r∠φ°`) get one extra
+cosmetic pass that regular numbers do NOT get: after rounding to
+`ANGLE_DECIMALS` places, if EVERY fractional digit turned out to be
+a zero, the decimal separator and those zeros are dropped.
+
+    "147,0"   →  "147"
+    "-90,0"   →  "-90"
+    "0,0"     →  "0"
+    "81,6"    →  "81,6"     (non-zero fractional digit: untouched)
+
+WHY THIS IS ANGLES-ONLY
+-----------------------
+This rule is applied inside `format_angle_value`, which is called
+from exactly one place — `parse_complex`, when it assembles the
+polar-form output of a complex number. Regular real results are
+formatted by `format_num`, which does NOT trim trailing zeros;
+that preserves the worksheet's own precision conventions for
+plain numeric results.
+
+WHY POST-ROUNDING, NOT PRE-ROUNDING
+-----------------------------------
+The trim must run on the *already-rounded* string. Example: an
+angle of `146.9999999999` rounds to `147,0` at one decimal place
+and should then collapse to `147`. A pre-rounding check would have
+seen a non-zero fractional digit and never trimmed.
+
+WHY IT MATTERS
+--------------
+Mathcad itself shows on-axis angles (like 180° or -90°) as plain
+integers. Without this trim a polar-form result would show up as
+`1∠180,0°`, which reads as noise. This rule is the polar-form
+counterpart of the "on-axis → rectangular" rule: they both keep
+axis-aligned results legible.
+
 IMPORTANT — "1∠" BEFORE AN ANGLE
 --------------------------------
 Mathcad writes `1·e^(j·deg·φ)` with an explicit modulus of 1, but it
@@ -196,6 +232,15 @@ class MathcadParser:
     sig_figs_large = 8
 
     # Number of decimal places for angles in polar form.
+    #
+    # NOTE: This applies ONLY to the angle in `r∠φ°` polar output
+    # (see `format_angle_value`). Regular real numbers go through
+    # `format_num` / `format_scientific` and are unaffected.
+    #
+    # NOTE: After rounding to this many decimals, the trailing
+    # fractional zeros are dropped if ALL of them are zero — see
+    # the module-level note "IMPORTANT — TRAILING-ZERO TRIMMING IN
+    # ANGLES".
     ANGLE_DECIMALS = 1
 
     # Scientific-notation threshold: numbers with |x| < 10^sci_threshold
@@ -424,6 +469,12 @@ class MathcadParser:
         "-0.49999999999999978" or "1.7347234759768071E-18". We parse with
         Python's float() (which understands "E-18") and re-emit with a
         comma decimal separator.
+
+        NOTE: This function does NOT trim trailing fractional zeros.
+        Its output is used for regular numbers, matrix entries, etc.
+        Angle trimming lives in `format_angle_value` (see the
+        module-level note "IMPORTANT — TRAILING-ZERO TRIMMING IN
+        ANGLES").
         """
         if not num_str:
             return ""
@@ -478,13 +529,31 @@ class MathcadParser:
 
     @classmethod
     def format_angle_value(cls, angle):
-        """
+        r"""
         Render a polar-form angle with a fixed number of decimals.
 
-        NOTE: Angles in Mathcad results often carry 15+ digits of
-        floating-point noise (e.g. 81.6078831602174). Rounding to one
-        decimal keeps the document readable. "Negative zero" is coerced
-        to exactly zero.
+        NOTE (rounding): Angles in Mathcad results often carry 15+
+        digits of floating-point noise (e.g. 81.6078831602174).
+        Rounding to `ANGLE_DECIMALS` places keeps the document
+        readable. "Negative zero" is coerced to exactly zero.
+
+        NOTE (trailing-zero trimming — see module-level note
+        "IMPORTANT — TRAILING-ZERO TRIMMING IN ANGLES"):
+        After rounding, if EVERY fractional digit is a zero, the
+        decimal separator and those zeros are dropped:
+
+            147.0  →  "147,0"  →  "147"
+            -90.0  →  "-90,0"  →  "-90"
+             0.0   →  "0,0"    →  "0"
+            81.6   →  "81,6"   (non-zero fraction: untouched)
+
+        The special string "-0" (produced when a tiny negative value
+        rounds to "-0,0" with fewer than the fractional digits) is
+        normalised to "0" so we never emit the LaTeX-hostile "-0".
+
+        IMPORTANT: this method is called ONLY from `parse_complex`
+        when rendering the polar form `r∠φ°`. Regular real numbers
+        go through `format_num` and do NOT get this trim.
         """
         try:
             value = float(angle)
@@ -495,6 +564,21 @@ class MathcadParser:
             value = 0.0
 
         text = f"{value:.{cls.ANGLE_DECIMALS}f}"
+
+        # NOTE (trailing-zero trimming): the trim MUST run on the
+        # rounded text, not on the pre-rounding value — otherwise an
+        # angle like 146.9999999 would never be trimmed even though
+        # it rounds to 147,0 and should collapse to 147.
+        if "." in text:
+            integer_part, fractional_part = text.split(".", 1)
+
+            if fractional_part and all(ch == "0" for ch in fractional_part):
+                text = integer_part
+
+                # "-0" (from e.g. -0.04 rounded to "-0.0") is a
+                # rendering artifact; emit plain "0" instead.
+                if text == "-0":
+                    text = "0"
 
         return text.replace(".", ",")
 
@@ -766,6 +850,15 @@ class MathcadParser:
 
             The off-axis case (both parts non-zero) keeps the polar
             form `r\angle\phi^\circ`.
+
+        NOTE (angle trimming): the polar angle is produced by
+        `format_angle_value`, which trims trailing fractional zeros
+        after rounding. So an off-axis result whose true angle rounds
+        to a whole number renders as `r\angle 147^\circ`, NOT
+        `r\angle 147,0^\circ`. This is the ONLY call site of
+        `format_angle_value` — see the module-level note
+        "IMPORTANT — TRAILING-ZERO TRIMMING IN ANGLES" for the
+        rationale and for why the rule is angles-only.
 
         NOTE (imag_symbol):
             The `imag_symbol` argument is kept for call-site
@@ -1990,32 +2083,32 @@ class MathcadParser:
         tag = cls.strip_ns(node.tag)
         children = list(node)
 
-        # --- math: top-level container inside a <region> --------------
+        # --- math: top-level container inside a <region> -------------- 
         if tag == "math":
             return " ".join(
                 cls.parse_node_to_latex(child)
                 for child in children
             )
 
-        # --- real number literal --------------------------------------
+        # --- real number literal -------------------------------------- 
         if tag == "real":
             return cls.format_num(
                 node.text.strip() if node.text else ""
             )
 
-        # --- identifier / symbol --------------------------------------
+        # --- identifier / symbol -------------------------------------- 
         if tag in ("id", "sym"):
             return cls.parse_identifier(node)
 
-        # --- string literal -------------------------------------------
+        # --- string literal ------------------------------------------- 
         if tag in ("str", "string"):
             return cls.parse_string(node)
 
-        # --- complex number result ------------------------------------
+        # --- complex number result ------------------------------------ 
         if tag == "complex":
             return cls.parse_complex_node(node)
 
-        # --- result / symResult wrappers ------------------------------
+        # --- result / symResult wrappers ------------------------------ 
         # These appear inside <eval> / <symEval> to hold numeric or
         # symbolic output. We just render their inner content.
         if tag in ("result", "symResult"):
@@ -2030,7 +2123,7 @@ class MathcadParser:
                 return cls.parse_string(node)
             return ""
 
-        # --- imaginary unit -------------------------------------------
+        # --- imaginary unit ------------------------------------------- 
         # MATHCAD QUIRK: Mathcad writes the imaginary unit as
         #   <imag symbol="j">1</imag>
         # where the text content is the coefficient (usually 1) and the
@@ -2058,11 +2151,11 @@ class MathcadParser:
 
             return f"{number}{symbol}"
 
-        # --- matrix ---------------------------------------------------
+        # --- matrix --------------------------------------------------- 
         if tag == "matrix":
             return cls.parse_matrix_node(node, children)
 
-        # --- explicit parentheses -------------------------------------
+        # --- explicit parentheses ------------------------------------- 
         if tag == "parens":
             child_latex = (
                 cls.parse_node_to_latex(children[0])
@@ -2070,7 +2163,7 @@ class MathcadParser:
             )
             return rf"\left({child_latex}\right)"
 
-        # --- operator application -------------------------------------
+        # --- operator application ------------------------------------- 
         # This is the BIG branch. The first child is the operator
         # (a self-closing element like <mult/>), the remaining children
         # are the operands.
@@ -2153,7 +2246,7 @@ class MathcadParser:
                 for child in children[1:]
             ]
 
-            # ---- multiplication ----
+            # ---- multiplication ---- 
             if op == "mult":
                 result = cls._process_mult_angle_args(
                     args, children
@@ -2168,7 +2261,7 @@ class MathcadParser:
                     result, marks_to_restore
                 )
 
-            # ---- division ----
+            # ---- division ---- 
             if op == "div":
                 if len(args) > 1:
                     return (
@@ -2231,7 +2324,7 @@ class MathcadParser:
                     return "-"
                 return cls._apply_negation(args[0])
 
-            # ---- exponentiation ----
+            # ---- exponentiation ---- 
             # Intercepts e^(j·deg·φ) and produces an angle mark; other
             # powers fall through to plain `{base}^{exp}`.
             #
@@ -2274,42 +2367,42 @@ class MathcadParser:
                     if args else ""
                 )
 
-            # ---- square root ----
+            # ---- square root ---- 
             if op == "sqrt":
                 return (
                     f"\\sqrt{{{args[0]}}}"
                     if args else "\\sqrt{?}"
                 )
 
-            # ---- absolute value ----
+            # ---- absolute value ---- 
             if op == "absval":
                 return (
                     f"\\left| {args[0]} \\right|"
                     if args else "\\left| ? \\right|"
                 )
 
-            # ---- complex conjugate ----
+            # ---- complex conjugate ---- 
             if op == "conjugate":
                 return (
                     f"\\overline{{{args[0]}}}"
                     if args else "\\overline{?}"
                 )
 
-            # ---- indexing / subscript access ----
+            # ---- indexing / subscript access ---- 
             if op == "indexer":
                 if not args:
                     return ""
                 index_latex = ", ".join(args[1:])
                 return rf"{args[0]}_{{\text[{index_latex}]}}"
 
-            # ---- matrix transpose ----
+            # ---- matrix transpose ---- 
             if op == "transpose":
                 return (
                     f"{{{args[0]}}}^{{T}}"
                     if args else "^{T}"
                 )
 
-            # ---- equality (used inside symbolic output) ----
+            # ---- equality (used inside symbolic output) ---- 
             if op == "equal":
                 if len(args) > 1:
                     return f"{args[0]} = {args[1]}"
@@ -2332,7 +2425,7 @@ class MathcadParser:
             # compiles.
             return "?"
 
-        # --- function definition (f(x) := ...) ------------------------
+        # --- function definition (f(x) := ...) ------------------------ 
         if tag == "function":
             bound_vars = next(
                 (
@@ -2367,7 +2460,7 @@ class MathcadParser:
                 + r"\right)"
             )
 
-        # --- comma-separated sequence ---------------------------------
+        # --- comma-separated sequence --------------------------------- 
         # Appears as the argument list of concat() and similar.
         if tag == "sequence":
             return ", ".join(
@@ -2375,12 +2468,12 @@ class MathcadParser:
                 for child in children
             )
 
-        # --- empty placeholder ----------------------------------------
+        # --- empty placeholder ---------------------------------------- 
         # Renders as the LaTeX "square" symbol.
         if tag == "placeholder":
             return r"\square"
 
-        # --- fallback: try each child in order ------------------------
+        # --- fallback: try each child in order ------------------------ 
         # Unknown wrapper — descend until we find something renderable.
         if children:
             for child in children:
@@ -2597,7 +2690,7 @@ class MathcadParser:
         content = []
 
         for region in regions:
-            # --- text regions become paragraphs -----------------------
+            # --- text regions become paragraphs ----------------------- 
             text_node = cls.find_first_by_tag(region, "text")
             if text_node is not None:
                 text_values = []
@@ -2618,7 +2711,7 @@ class MathcadParser:
                     if text_value:
                         content.append(f"{text_value}\n\n")
 
-            # --- math regions become display equations ----------------
+            # --- math regions become display equations ---------------- 
             math_node = cls.find_first_by_tag(region, "math")
             if math_node is None:
                 continue
