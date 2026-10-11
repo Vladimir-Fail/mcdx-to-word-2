@@ -1,4 +1,4 @@
-"""
+r"""
 Mathcad 14/15 (.xmcd / .xml) → Markdown with LaTeX → DOCX converter.
 
 WHY THIS FILE EXISTS
@@ -21,9 +21,20 @@ Pipeline:
     .xmcd (XML)  --[MathcadParser.process_file]-->  Markdown+LaTeX
     Markdown+LaTeX  --[WordConverter.convert_to_word]-->  .docx
 
-Two numeric-formatting knobs matter downstream:
-  * `sig_figs_small` / `sig_figs_large` — significand digits.
-  * `sci_threshold` — switch small numbers to scientific notation.
+Numeric-formatting settings (editable in the GUI):
+  * `rounding_mode`: "decimal_places" or the legacy "significant" mode.
+  * `decimal_places`: maximum fractional digits; trailing zeros are removed.
+  * `sig_figs_small` / `sig_figs_large`: legacy significant-digit controls.
+  * `ANGLE_DECIMALS`: independent precision for polar angles.
+  * `sci_threshold`: optional scientific notation for small numbers.
+
+Fixed-decimal formatting uses Decimal with ROUND_HALF_UP: a tie rounds
+away from zero (2.675 -> 2.68, -2.675 -> -2.68). XML decimals are read
+without a float conversion. Complex calculations still use floats, as
+before. Formatting changes display only, not the original worksheet.
+All numeric XML nodes are formatted, including numbers in input formulas.
+If scientific notation is enabled, decimal_places applies to the mantissa;
+small nonzero numbers then remain visible instead of rounding to zero.
 
 The parser uses a Russian-locale convention: decimal comma ",".
 This matches how Mathcad regional output looks and how the resulting
@@ -94,41 +105,17 @@ part only). Angles at other values keep the polar `r∠φ°` form.
 Angles outside `<symResult>` — i.e. in the user's original input
 expression — are NOT affected by this rule.
 
-IMPORTANT — TRAILING-ZERO TRIMMING IN ANGLES
---------------------------------------------
-Angles in polar-form complex numbers (`r∠φ°`) get one extra
-cosmetic pass that regular numbers do NOT get: after rounding to
-`ANGLE_DECIMALS` places, if EVERY fractional digit turned out to be
-a zero, the decimal separator and those zeros are dropped.
-
-    "147,0"   →  "147"
-    "-90,0"   →  "-90"
-    "0,0"     →  "0"
-    "81,6"    →  "81,6"     (non-zero fractional digit: untouched)
-
-WHY THIS IS ANGLES-ONLY
------------------------
-This rule is applied inside `format_angle_value`, which is called
-from exactly one place — `parse_complex`, when it assembles the
-polar-form output of a complex number. Regular real results are
-formatted by `format_num`, which does NOT trim trailing zeros;
-that preserves the worksheet's own precision conventions for
-plain numeric results.
-
-WHY POST-ROUNDING, NOT PRE-ROUNDING
------------------------------------
-The trim must run on the *already-rounded* string. Example: an
-angle of `146.9999999999` rounds to `147,0` at one decimal place
-and should then collapse to `147`. A pre-rounding check would have
-seen a non-zero fractional digit and never trimmed.
-
-WHY IT MATTERS
---------------
-Mathcad itself shows on-axis angles (like 180° or -90°) as plain
-integers. Without this trim a polar-form result would show up as
-`1∠180,0°`, which reads as noise. This rule is the polar-form
-counterpart of the "on-axis → rectangular" rule: they both keep
-axis-aligned results legible.
+IMPORTANT — ROUNDING AND TRAILING ZEROS
+--------------------------------------
+Numbers in fixed-decimal mode and polar angles use one formatter:
+round first, then remove only trailing FRACTIONAL zeros and the empty
+separator. Examples with three decimal places:
+  12.3400 -> "12,34"; 12.0000 -> "12"; 1200 -> "1200".
+  -0.0004 -> "0" (negative zero is never displayed).
+Never use rstrip("0") on an integer: it would turn 1200 into 12.
+Angles have independent precision and are not converted to scientific
+notation. In significant-digit mode the legacy precision heuristic is
+preserved; exponent output is expanded without the old 20-place limit.
 
 IMPORTANT — "1∠" BEFORE AN ANGLE
 --------------------------------
@@ -186,6 +173,7 @@ factors to put numbers first. Both would require reaching inside
 """
 
 import math
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 import os
 import re
 import sys
@@ -227,20 +215,14 @@ class MathcadParser:
         Mathcad users usually write top-to-bottom.
     """
 
-    # Numeric formatting knobs (overridable from the GUI).
+    # Режим «знаки после запятой» — новый режим по умолчанию.
+    # Старый режим значащих цифр доступен через rounding_mode="significant".
+    rounding_mode = "decimal_places"
+    decimal_places = 3
     sig_figs_small = 4
     sig_figs_large = 8
 
-    # Number of decimal places for angles in polar form.
-    #
-    # NOTE: This applies ONLY to the angle in `r∠φ°` polar output
-    # (see `format_angle_value`). Regular real numbers go through
-    # `format_num` / `format_scientific` and are unaffected.
-    #
-    # NOTE: After rounding to this many decimals, the trailing
-    # fractional zeros are dropped if ALL of them are zero — see
-    # the module-level note "IMPORTANT — TRAILING-ZERO TRIMMING IN
-    # ANGLES".
+    # Углы имеют отдельную точность; конечные дробные нули удаляются всегда.
     ANGLE_DECIMALS = 1
 
     # Scientific-notation threshold: numbers with |x| < 10^sci_threshold
@@ -415,172 +397,128 @@ class MathcadParser:
 
         return base_sig_figs
 
-    @classmethod
-    def format_scientific(cls, value, sig_figs):
-        r"""
-        Render a number as LaTeX scientific notation: m \cdot 10^{n}.
+    @staticmethod
+    def _as_decimal(value):
+        """Читает XML-число без потери десятичных цифр; принимает также запятую."""
+        if isinstance(value, Decimal):
+            return value
+        return Decimal(str(value).strip().replace(",", "."))
 
-        NOTES:
-          * Decimal separator is a comma (Russian locale).
-          * Trailing zeros in the mantissa are trimmed.
-          * Exponent 0 is elided (returns just the mantissa).
-        """
-        if value == 0:
+    @staticmethod
+    def _trim_fractional_zeros(text):
+        """Удаляет только конечные дробные нули и нормализует отрицательный ноль."""
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        if text in ("-0", "+0", ""):
             return "0"
+        return text
 
-        sign = "-" if value < 0 else ""
-        abs_value = abs(value)
+    @classmethod
+    def format_fixed_decimal(cls, value, places):
+        """Округляет до places дробных знаков по ROUND_HALF_UP и удаляет нули.
 
-        decimals = max(sig_figs - 1, 0)
+        NOTE: Decimal создаётся из исходной строки, а не из float.
+        Контекст расширяется для больших целых и переноса 9.999 -> 10.
+        Нули удаляются после округления, без изменения целой части.
+        """
+        places = int(places)
+        if not 0 <= places <= 20:
+            raise ValueError("Число знаков после запятой должно быть от 0 до 20.")
+        number = cls._as_decimal(value)
+        if not number.is_finite():
+            return str(number)
+        if number.is_zero():
+            return "0"
+        with localcontext() as context:
+            context.prec = max(28, len(number.as_tuple().digits),
+                               number.adjusted() + places + 3)
+            rounded = number.quantize(Decimal(1).scaleb(-places),
+                                      rounding=ROUND_HALF_UP)
+        return cls._trim_fractional_zeros(format(rounded, "f")).replace(".", ",")
 
-        sci_str = f"{abs_value:.{decimals}e}"
-        mantissa_part, exp_part = sci_str.split("e")
-        exponent = int(exp_part)
-        mantissa_str = mantissa_part
+    @classmethod
+    def format_scientific(cls, value, sig_figs=None):
+        r"""Выводит m \cdot 10^{k} без конечных нулей в мантиссе.
 
-        # Trim insignificant zeros in the mantissa.
-        if "." in mantissa_str:
-            mantissa_str = mantissa_str.rstrip("0").rstrip(".")
-
-        if not mantissa_str:
-            mantissa_str = "0"
-
-        mantissa_str = mantissa_str.replace(".", ",")
-
+        В новом режиме decimal_places задаёт дробные знаки мантиссы.
+        В старом режиме sig_figs задаёт число её значащих цифр.
+        Перенос округлённой мантиссы 10 -> 1 увеличивает показатель.
+        """
+        number = cls._as_decimal(value)
+        if not number.is_finite():
+            return str(number)
+        if number.is_zero():
+            return "0"
+        exponent = number.copy_abs().adjusted()
+        if cls.rounding_mode == "decimal_places":
+            places = cls.decimal_places
+        else:
+            if sig_figs is None:
+                sig_figs = cls._compute_target_sig_figs(number.copy_abs())
+            places = max(int(sig_figs) - 1, 0)
+        with localcontext() as context:
+            context.prec = max(28, len(number.as_tuple().digits) + 3, places + 3)
+            mantissa = number.scaleb(-exponent)
+            text = cls.format_fixed_decimal(mantissa, places)
+            if abs(cls._as_decimal(text)) >= 10:
+                exponent += 1
+                text = cls.format_fixed_decimal(mantissa / Decimal(10), places)
         if exponent == 0:
-            return sign + mantissa_str
-
-        return (
-            rf"{sign}{mantissa_str}"
-            rf" \cdot 10^{{{exponent}}}"
-        )
+            return text
+        return rf"{text} \cdot 10^{{{exponent}}}"
 
     @classmethod
     def format_num(cls, num_str):
+        """Форматирует числовые узлы: входные формулы, результаты и матрицы.
+
+        decimal_places: не более N дробных знаков, без конечных нулей.
+        significant: прежняя эвристика значащих цифр, включая бонус для 1/2.
+        Научная форма выбирается по исходному модулю ДО округления.
+        Нечисловая строка возвращается с заменой точки на запятую.
         """
-        Format a raw numeric string from XML into a display-ready string.
-
-        Handles:
-          * Zero → "0".
-          * Optional scientific notation (if sci_threshold is set).
-          * Fallback to the input string if parsing fails.
-
-        NOTE: `<real>` elements contain the raw decimal in C locale, e.g.
-        "-0.49999999999999978" or "1.7347234759768071E-18". We parse with
-        Python's float() (which understands "E-18") and re-emit with a
-        comma decimal separator.
-
-        NOTE: This function does NOT trim trailing fractional zeros.
-        Its output is used for regular numbers, matrix entries, etc.
-        Angle trimming lives in `format_angle_value` (see the
-        module-level note "IMPORTANT — TRAILING-ZERO TRIMMING IN
-        ANGLES").
-        """
-        if not num_str:
+        if num_str is None or str(num_str).strip() == "":
             return ""
-
         try:
-            value = float(num_str)
-
-            if value == 0:
-                return "0"
-
-            abs_value = abs(value)
-
-            # Route very small / very large magnitudes through the
-            # scientific formatter when the user enabled it.
-            if cls.sci_threshold is not None:
-                threshold = 10.0 ** cls.sci_threshold
-
-                if abs_value < threshold:
-                    target_sig_figs = cls._compute_target_sig_figs(
-                        abs_value
-                    )
-                    return cls.format_scientific(
-                        value, target_sig_figs
-                    )
-
-            target_sig_figs = cls._compute_target_sig_figs(
-                abs_value
-            )
-
-            formatted = f"{value:.{target_sig_figs}g}"
-
-            # Python's %g may fall back to exponent form (e.g. 1.7e-18).
-            # That form is not LaTeX-friendly, so expand it.
-            if "e" in formatted.lower():
-                rounded_value = float(formatted)
-
-                result = (
-                    f"{rounded_value:.20f}"
-                    .rstrip("0")
-                    .rstrip(".")
-                )
-
-                if not result:
-                    result = "0"
-            else:
-                result = formatted
-
-            return result.replace(".", ",")
-
-        except (ValueError, TypeError):
+            number = cls._as_decimal(num_str)
+        except (InvalidOperation, ValueError, TypeError):
             return str(num_str).replace(".", ",")
+        if not number.is_finite():
+            return str(number)
+        if number.is_zero():
+            return "0"
+        absolute = number.copy_abs()
+        if cls.sci_threshold is not None:
+            threshold = Decimal(1).scaleb(int(cls.sci_threshold))
+            if absolute < threshold:
+                return cls.format_scientific(number)
+        if cls.rounding_mode == "decimal_places":
+            return cls.format_fixed_decimal(number, cls.decimal_places)
+        if cls.rounding_mode != "significant":
+            raise ValueError("Неизвестный режим округления.")
+        target = cls._compute_target_sig_figs(absolute)
+        # Сохраняем старое округление через float для обычных конечных значений.
+        value = float(number)
+        if math.isfinite(value) and value != 0:
+            formatted = f"{value:.{target}g}"
+        else:
+            with localcontext() as context:
+                context.prec = target
+                formatted = str(+number)
+        # Decimal раскрывает экспоненту точно, не обнуляя значения < 1e-20.
+        plain = format(Decimal(formatted), "f")
+        return cls._trim_fractional_zeros(plain).replace(".", ",")
 
     @classmethod
     def format_angle_value(cls, angle):
-        r"""
-        Render a polar-form angle with a fixed number of decimals.
+        """Угол: отдельная точность ANGLE_DECIMALS, без конечных дробных нулей.
 
-        NOTE (rounding): Angles in Mathcad results often carry 15+
-        digits of floating-point noise (e.g. 81.6078831602174).
-        Rounding to `ANGLE_DECIMALS` places keeps the document
-        readable. "Negative zero" is coerced to exactly zero.
-
-        NOTE (trailing-zero trimming — see module-level note
-        "IMPORTANT — TRAILING-ZERO TRIMMING IN ANGLES"):
-        After rounding, if EVERY fractional digit is a zero, the
-        decimal separator and those zeros are dropped:
-
-            147.0  →  "147,0"  →  "147"
-            -90.0  →  "-90,0"  →  "-90"
-             0.0   →  "0,0"    →  "0"
-            81.6   →  "81,6"   (non-zero fraction: untouched)
-
-        The special string "-0" (produced when a tiny negative value
-        rounds to "-0,0" with fewer than the fractional digits) is
-        normalised to "0" so we never emit the LaTeX-hostile "-0".
-
-        IMPORTANT: this method is called ONLY from `parse_complex`
-        when rendering the polar form `r∠φ°`. Regular real numbers
-        go through `format_num` and do NOT get this trim.
+        NOTE: Не зависит от режима обычных чисел и научного порога.
         """
         try:
-            value = float(angle)
-        except (ValueError, TypeError):
+            number = cls._as_decimal(angle)
+        except (InvalidOperation, ValueError, TypeError):
             return str(angle).replace(".", ",")
-
-        if math.isclose(value, 0.0, abs_tol=1e-12):
-            value = 0.0
-
-        text = f"{value:.{cls.ANGLE_DECIMALS}f}"
-
-        # NOTE (trailing-zero trimming): the trim MUST run on the
-        # rounded text, not on the pre-rounding value — otherwise an
-        # angle like 146.9999999 would never be trimmed even though
-        # it rounds to 147,0 and should collapse to 147.
-        if "." in text:
-            integer_part, fractional_part = text.split(".", 1)
-
-            if fractional_part and all(ch == "0" for ch in fractional_part):
-                text = integer_part
-
-                # "-0" (from e.g. -0.04 rounded to "-0.0") is a
-                # rendering artifact; emit plain "0" instead.
-                if text == "-0":
-                    text = "0"
-
-        return text.replace(".", ",")
+        return cls.format_fixed_decimal(number, cls.ANGLE_DECIMALS)
 
     # -------------------------------------------------------------------
     # LaTeX escaping
@@ -851,14 +789,9 @@ class MathcadParser:
             The off-axis case (both parts non-zero) keeps the polar
             form `r\angle\phi^\circ`.
 
-        NOTE (angle trimming): the polar angle is produced by
-        `format_angle_value`, which trims trailing fractional zeros
-        after rounding. So an off-axis result whose true angle rounds
-        to a whole number renders as `r\angle 147^\circ`, NOT
-        `r\angle 147,0^\circ`. This is the ONLY call site of
-        `format_angle_value` — see the module-level note
-        "IMPORTANT — TRAILING-ZERO TRIMMING IN ANGLES" for the
-        rationale and for why the rule is angles-only.
+        NOTE (angle trimming): format_angle_value uses independent
+        ANGLE_DECIMALS and removes every trailing fractional zero.
+        Ordinary numbers use the selected rounding mode instead.
 
         NOTE (imag_symbol):
             The `imag_symbol` argument is kept for call-site
@@ -1577,7 +1510,7 @@ class MathcadParser:
         that polar-form entries stay readable (they are much wider than
         rectangular entries).
         """
-        return r"\angle" in latex or latex.rstrip().endswith("i")
+        return r"\angle" in latex or latex.rstrip().endswith(MathcadParser.IMAGINARY_SYMBOL)
 
     # -------------------------------------------------------------------
     # mult-operator post-processing
@@ -1612,7 +1545,7 @@ class MathcadParser:
 
     @staticmethod
     def _is_angle_mark_wrapped(text):
-        """
+        r"""
         True if `text` is an angle fragment (resolved or unresolved),
         optionally wrapped in \left( ... \right).
 
@@ -1665,21 +1598,14 @@ class MathcadParser:
         except ValueError:
             return None
 
-    @staticmethod
-    def _format_number(value):
-        """
-        Inverse of `_try_parse_number`. Returns a string with comma
-        decimal separator, or None if the value cannot be represented
-        in plain (non-scientific) form.
-        """
-        if value == int(value) and abs(value) < 1e15:
-            return str(int(value))
+    @classmethod
+    def _format_number(cls, value):
+        """Форматирует объединённые множители с текущей точностью.
 
-        text = f"{value:.10g}"
-        if "e" in text.lower() or "E" in text:
-            return None
-
-        return text.replace(".", ",")
+        Научный результат не объединяем: этот путь ожидает обычное число.
+        """
+        text = cls.format_num(value)
+        return None if r"\cdot" in text else text
 
     @classmethod
     def _process_mult_angle_args(cls, args, children):
@@ -2855,7 +2781,8 @@ class ConverterApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Mathcad to Word Converter (со стилями)")
-        self.root.geometry("600x780")
+        self.root.geometry("680x920")
+        self.root.minsize(640, 800)
         self.root.configure(padx=20, pady=20)
 
         self.input_file = None
@@ -2931,83 +2858,92 @@ class ConverterApp:
                 font=("Segoe UI", 8, "italic")
             ).pack(side=tk.BOTTOM, pady=5)
 
-        # ---- Numeric formatting controls ----
+        # ---- Настройки отображения чисел и независимая точность углов ----
         frame_settings = ttk.LabelFrame(
-            self.root,
-            text="Настройки округления (значащие цифры)",
-            padding=10
+            self.root, text="Настройки округления", padding=10
         )
         frame_settings.pack(fill=tk.X, pady=(0, 15))
+        frame_settings.columnconfigure(0, weight=1)
 
+        self.rounding_mode_var = tk.StringVar(value="decimal_places")
+        self.decimal_places_var = tk.IntVar(value=3)
+        self.angle_decimals_var = tk.IntVar(value=1)
         self.sig_figs_small_var = tk.IntVar(value=4)
         self.sig_figs_large_var = tk.IntVar(value=8)
 
-        ttk.Label(
-            frame_settings,
-            text="Для малых чисел и дробей (по умолчанию 4):"
-        ).grid(row=0, column=0, sticky=tk.W, pady=2)
-
-        ttk.Spinbox(
-            frame_settings, from_=1, to=15,
-            textvariable=self.sig_figs_small_var, width=5
-        ).grid(row=0, column=1, sticky=tk.W, padx=10, pady=2)
-
-        ttk.Label(
-            frame_settings,
-            text="Для больших чисел (по умолчанию 8):"
-        ).grid(row=1, column=0, sticky=tk.W, pady=2)
-
-        ttk.Spinbox(
-            frame_settings, from_=1, to=20,
-            textvariable=self.sig_figs_large_var, width=5
-        ).grid(row=1, column=1, sticky=tk.W, padx=10, pady=2)
-
-        # ---- Scientific-notation section ----
-        ttk.Separator(
-            frame_settings, orient="horizontal"
-        ).grid(
-            row=2, column=0, columnspan=2,
-            sticky="ew", pady=(8, 6)
+        ttk.Radiobutton(
+            frame_settings, text="По числу знаков после запятой",
+            variable=self.rounding_mode_var, value="decimal_places",
+            command=self.toggle_rounding_mode
+        ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=2)
+        ttk.Label(frame_settings, text="Максимум знаков после запятой:").grid(
+            row=1, column=0, sticky=tk.W, pady=2
         )
-
-        self.use_sci_var = tk.BooleanVar(value=False)
-
-        ttk.Checkbutton(
-            frame_settings,
-            text="Научная форма для малых чисел",
-            variable=self.use_sci_var,
-            command=self.toggle_sci
-        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=2)
-
+        self.decimal_spinbox = ttk.Spinbox(
+            frame_settings, from_=0, to=20,
+            textvariable=self.decimal_places_var, width=6
+        )
+        self.decimal_spinbox.grid(row=1, column=1, padx=10, pady=2)
         ttk.Label(
             frame_settings,
-            text="Порог 10^N (например -4):"
-        ).grid(row=4, column=0, sticky=tk.W, pady=2)
+            text="Конечные нули удаляются: 12,340 → 12,34; 12,000 → 12.",
+            foreground="gray", wraplength=590
+        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(2, 6))
 
+        ttk.Radiobutton(
+            frame_settings, text="По значащим цифрам (прежний режим)",
+            variable=self.rounding_mode_var, value="significant",
+            command=self.toggle_rounding_mode
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=2)
+        ttk.Label(frame_settings, text="Для малых чисел и дробей:").grid(
+            row=4, column=0, sticky=tk.W, pady=2
+        )
+        self.sig_small_spinbox = ttk.Spinbox(
+            frame_settings, from_=1, to=15,
+            textvariable=self.sig_figs_small_var, width=6
+        )
+        self.sig_small_spinbox.grid(row=4, column=1, padx=10, pady=2)
+        ttk.Label(frame_settings, text="Для больших чисел:").grid(
+            row=5, column=0, sticky=tk.W, pady=2
+        )
+        self.sig_large_spinbox = ttk.Spinbox(
+            frame_settings, from_=1, to=20,
+            textvariable=self.sig_figs_large_var, width=6
+        )
+        self.sig_large_spinbox.grid(row=5, column=1, padx=10, pady=2)
+        ttk.Label(frame_settings, text="Знаков после запятой в углах:").grid(
+            row=6, column=0, sticky=tk.W, pady=2
+        )
+        ttk.Spinbox(
+            frame_settings, from_=0, to=20,
+            textvariable=self.angle_decimals_var, width=6
+        ).grid(row=6, column=1, padx=10, pady=2)
+        self.toggle_rounding_mode()
+
+        ttk.Separator(frame_settings, orient="horizontal").grid(
+            row=7, column=0, columnspan=2, sticky="ew", pady=(8, 6)
+        )
+        self.use_sci_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame_settings, text="Научная форма для малых чисел",
+            variable=self.use_sci_var, command=self.toggle_sci
+        ).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=2)
+        ttk.Label(frame_settings, text="Порог 10^N (например -4):").grid(
+            row=9, column=0, sticky=tk.W, pady=2
+        )
         self.sci_threshold_var = tk.IntVar(value=-4)
         self.sci_spinbox = ttk.Spinbox(
             frame_settings, from_=-15, to=0,
-            textvariable=self.sci_threshold_var, width=5
+            textvariable=self.sci_threshold_var, width=6, state="disabled"
         )
-        self.sci_spinbox.grid(
-            row=4, column=1, sticky=tk.W, padx=10, pady=2
-        )
-        self.sci_spinbox.config(state="disabled")
-
+        self.sci_spinbox.grid(row=9, column=1, padx=10, pady=2)
         ttk.Label(
             frame_settings,
-            text=(
-                "Числа с модулем меньше 10^N выводятся в виде "
-                "m·10^k, например 6,344·10^-6."
-            ),
-            font=("Segoe UI", 8, "italic"),
-            foreground="gray",
-            wraplength=520,
-            justify=tk.LEFT
-        ).grid(
-            row=5, column=0, columnspan=2,
-            sticky=tk.W, pady=(4, 0)
-        )
+            text=("При |x| < 10^N используется m·10^k. В режиме знаков после "
+                  "запятой выбранная точность применяется к мантиссе m. "
+                  "Без научной формы очень малые числа могут округлиться до 0."),
+            foreground="gray", wraplength=590, justify=tk.LEFT
+        ).grid(row=10, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
 
         # ---- Template picker ----
         frame_template = ttk.LabelFrame(
@@ -3050,12 +2986,61 @@ class ConverterApp:
         )
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
-        # Kick off Pandoc check asynchronously so the UI stays responsive.
+        # Проверяем Pandoc после первоначальной отрисовки окна.
+        # after() откладывает вызов, но не запускает фоновый поток.
         self.log("Проверка окружения...")
         self.root.after(
             500,
             lambda: WordConverter.check_pandoc(self.log)
         )
+
+    def toggle_rounding_mode(self):
+        """Оставляет активными только поля выбранного режима округления."""
+        fixed = self.rounding_mode_var.get() == "decimal_places"
+        self.decimal_spinbox.config(state="normal" if fixed else "disabled")
+        state = "disabled" if fixed else "normal"
+        self.sig_small_spinbox.config(state=state)
+        self.sig_large_spinbox.config(state=state)
+
+    @staticmethod
+    def _read_bounded_int(variable, label, minimum, maximum):
+        """Проверяет ручной ввод: пределы Spinbox сами его не ограничивают."""
+        try:
+            value = variable.get()
+        except (tk.TclError, ValueError, TypeError) as exc:
+            raise ValueError(f"{label}: введите целое число.") from exc
+        if not isinstance(value, int) or not minimum <= value <= maximum:
+            raise ValueError(f"{label}: допустимы числа от {minimum} до {maximum}.")
+        return value
+
+    def read_formatting_settings(self):
+        """Возвращает проверенные настройки, не изменяя состояние парсера."""
+        mode = self.rounding_mode_var.get()
+        if mode not in ("decimal_places", "significant"):
+            raise ValueError("Выберите режим округления.")
+        settings = {
+            "rounding_mode": mode,
+            "ANGLE_DECIMALS": self._read_bounded_int(
+                self.angle_decimals_var, "Точность углов", 0, 20
+            ),
+            "sci_threshold": None,
+        }
+        if mode == "decimal_places":
+            settings["decimal_places"] = self._read_bounded_int(
+                self.decimal_places_var, "Знаки после запятой", 0, 20
+            )
+        else:
+            settings["sig_figs_small"] = self._read_bounded_int(
+                self.sig_figs_small_var, "Значащие цифры для малых чисел", 1, 15
+            )
+            settings["sig_figs_large"] = self._read_bounded_int(
+                self.sig_figs_large_var, "Значащие цифры для больших чисел", 1, 20
+            )
+        if self.use_sci_var.get():
+            settings["sci_threshold"] = self._read_bounded_int(
+                self.sci_threshold_var, "Порог научной формы", -15, 0
+            )
+        return settings
 
     def toggle_sci(self):
         """Enable/disable the sci-threshold spinbox."""
@@ -3069,7 +3054,7 @@ class ConverterApp:
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
-        self.root.update()
+        self.root.update_idletasks()
 
     # -------------------------------------------------------------------
     # File selection
@@ -3088,11 +3073,9 @@ class ConverterApp:
 
     def on_drop(self, event):
         """Handle a drag-and-drop file."""
-        filepath = event.data
-        # tkinterdnd2 wraps paths with spaces in {curly braces}.
-        if filepath.startswith("{") and filepath.endswith("}"):
-            filepath = filepath[1:-1]
-        self.set_input_file(filepath)
+        paths = self.root.tk.splitlist(event.data)
+        if paths:
+            self.set_input_file(paths[0])
 
     def set_input_file(self, filepath):
         if filepath.lower().endswith((".xmcd", ".xml")):
@@ -3130,6 +3113,13 @@ class ConverterApp:
         if not self.input_file:
             return
 
+        # Некорректный ввод не подменяем значениями по умолчанию молча.
+        try:
+            settings = self.read_formatting_settings()
+        except ValueError as exc:
+            messagebox.showerror("Ошибка настроек округления", str(exc))
+            return
+
         output_file = filedialog.asksaveasfilename(
             title="Сохранить результат как...",
             defaultextension=".docx",
@@ -3165,42 +3155,26 @@ class ConverterApp:
 
         self.log("\n--- Запуск обработки ---")
 
-        # Push GUI settings into the parser's class-level knobs.
-        try:
-            MathcadParser.sig_figs_small = (
-                self.sig_figs_small_var.get()
-            )
-            MathcadParser.sig_figs_large = (
-                self.sig_figs_large_var.get()
-            )
+        # Передаём только проверенные параметры выбранного режима.
+        for name, value in settings.items():
+            setattr(MathcadParser, name, value)
+        if MathcadParser.rounding_mode == "decimal_places":
             self.log(
-                "[INFO] Округление: "
-                f"малые числа = {MathcadParser.sig_figs_small}, "
-                f"большие числа = {MathcadParser.sig_figs_large}"
-            )
-        except Exception:
-            self.log(
-                "[WARN] Ошибка чтения настроек округления. "
-                "Используются значения 4 и 8."
-            )
-            MathcadParser.sig_figs_small = 4
-            MathcadParser.sig_figs_large = 8
-
-        if self.use_sci_var.get():
-            try:
-                threshold = int(self.sci_threshold_var.get())
-            except Exception:
-                threshold = -4
-
-            MathcadParser.sci_threshold = threshold
-            self.log(
-                "[INFO] Научная форма включена: "
-                f"числа с модулем < 10^{threshold} "
-                "будут выводиться в виде m·10^k"
+                f"[INFO] Округление: до {MathcadParser.decimal_places} "
+                "знаков после запятой; конечные нули удаляются."
             )
         else:
-            MathcadParser.sci_threshold = None
-            self.log("[INFO] Научная форма отключена")
+            self.log(
+                f"[INFO] Значащие цифры: малые = {MathcadParser.sig_figs_small}, "
+                f"большие = {MathcadParser.sig_figs_large}."
+            )
+        self.log(f"[INFO] Точность углов: {MathcadParser.ANGLE_DECIMALS} знаков.")
+        if MathcadParser.sci_threshold is not None:
+            self.log(
+                f"[INFO] Научная форма: |x| < 10^{MathcadParser.sci_threshold}."
+            )
+        else:
+            self.log("[INFO] Научная форма отключена.")
 
         self.log("[INFO] Парсинг XML файла Mathcad...")
 
