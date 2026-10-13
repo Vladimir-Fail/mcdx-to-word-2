@@ -26,7 +26,8 @@ Numeric-formatting settings (editable in the GUI):
   * `decimal_places`: maximum fractional digits; trailing zeros are removed.
   * `sig_figs_small` / `sig_figs_large`: legacy significant-digit controls.
   * `ANGLE_DECIMALS`: independent precision for polar angles.
-  * `sci_threshold`: optional scientific notation for small numbers.
+  * `sci_threshold`: optional scientific notation for small numbers (|x| < 10^N).
+  * `sci_threshold_large`: optional scientific notation for large numbers (|x| >= 10^M).
 
 Fixed-decimal formatting uses Decimal with ROUND_HALF_UP: a tie rounds
 away from zero (2.675 -> 2.68, -2.675 -> -2.68). XML decimals are read
@@ -310,9 +311,12 @@ class MathcadParser:
     # Углы имеют отдельную точность; конечные дробные нули удаляются всегда.
     ANGLE_DECIMALS = 1
 
-    # Scientific-notation threshold: numbers with |x| < 10^sci_threshold
-    # are rendered as "m·10^k". `None` disables the feature.
+    # Scientific-notation thresholds:
+    #   * sci_threshold: numbers with |x| < 10^sci_threshold -> "m·10^k"
+    #   * sci_threshold_large: numbers with |x| >= 10^sci_threshold_large -> "m·10^k"
+    # `None` disables the corresponding threshold.
     sci_threshold = None
+    sci_threshold_large = None
 
     # -------------------------------------------------------------------
     # Imaginary-unit symbol
@@ -524,7 +528,9 @@ class MathcadParser:
 
         decimal_places: не более N дробных знаков, без конечных нулей.
         significant: прежняя эвристика значащих цифр, включая бонус для 1/2.
-        Научная форма выбирается по исходному модулю ДО округления.
+        Научная форма выбирается по исходному модулю ДО округления
+        (для малых чисел при |x| < 10^sci_threshold, для больших при
+        |x| >= 10^sci_threshold_large).
         Нечисловая строка возвращается с заменой точки на запятую.
         """
         if num_str is None or str(num_str).strip() == "":
@@ -541,6 +547,10 @@ class MathcadParser:
         if cls.sci_threshold is not None:
             threshold = Decimal(1).scaleb(int(cls.sci_threshold))
             if absolute < threshold:
+                return cls.format_scientific(number)
+        if cls.sci_threshold_large is not None:
+            threshold_large = Decimal(1).scaleb(int(cls.sci_threshold_large))
+            if absolute >= threshold_large:
                 return cls.format_scientific(number)
         if cls.rounding_mode == "decimal_places":
             return cls.format_fixed_decimal(number, cls.decimal_places)
@@ -1420,16 +1430,21 @@ class MathcadParser:
 
     @staticmethod
     def _is_pure_number_latex(text):
-        """True if text is purely a number (possibly signed, with comma)."""
-        return bool(re.match(r"^[+-]?[\d,.]+$", text.strip()))
+        """True if text is purely a number (plain or scientific notation, with comma)."""
+        return bool(
+            re.fullmatch(
+                r"[+-]?[\d,.]+(?:\s*\\cdot\s*10\^\{[+-]?\d+\})?",
+                text.strip()
+            )
+        )
 
     @staticmethod
     def _is_simple_coefficient(text):
-        """True for a plain number or a plain identifier (with optional subscript)."""
+        """True for a number (plain or scientific) or a plain identifier (with optional subscript)."""
         stripped = text.strip()
         if not stripped:
             return False
-        if re.fullmatch(r"[+-]?[\d,.]+", stripped):
+        if MathcadParser._is_pure_number_latex(stripped):
             return True
         if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(_\{[^}]*\})?", stripped):
             return True
@@ -2424,8 +2439,8 @@ class ConverterApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Mathcad to Word Converter (со стилями)")
-        self.root.geometry("680x920")
-        self.root.minsize(640, 800)
+        self.root.geometry("680x980")
+        self.root.minsize(640, 860)
         self.root.configure(padx=20, pady=20)
 
         self.input_file = None
@@ -2570,7 +2585,7 @@ class ConverterApp:
             frame_settings, text="Научная форма для малых чисел",
             variable=self.use_sci_var, command=self.toggle_sci
         ).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=2)
-        ttk.Label(frame_settings, text="Порог 10^N (например -4):").grid(
+        ttk.Label(frame_settings, text="Порог 10^N для малых чисел (например -4):").grid(
             row=9, column=0, sticky=tk.W, pady=2
         )
         self.sci_threshold_var = tk.IntVar(value=-4)
@@ -2579,13 +2594,29 @@ class ConverterApp:
             textvariable=self.sci_threshold_var, width=6, state="disabled"
         )
         self.sci_spinbox.grid(row=9, column=1, padx=10, pady=2)
+
+        self.use_sci_large_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame_settings, text="Научная форма для больших чисел",
+            variable=self.use_sci_large_var, command=self.toggle_sci_large
+        ).grid(row=10, column=0, columnspan=2, sticky=tk.W, pady=(6, 2))
+        ttk.Label(frame_settings, text="Порог 10^M для больших чисел (например 4):").grid(
+            row=11, column=0, sticky=tk.W, pady=2
+        )
+        self.sci_large_threshold_var = tk.IntVar(value=4)
+        self.sci_large_spinbox = ttk.Spinbox(
+            frame_settings, from_=1, to=20,
+            textvariable=self.sci_large_threshold_var, width=6, state="disabled"
+        )
+        self.sci_large_spinbox.grid(row=11, column=1, padx=10, pady=2)
+
         ttk.Label(
             frame_settings,
-            text=("При |x| < 10^N используется m·10^k. В режиме знаков после "
-                  "запятой выбранная точность применяется к мантиссе m. "
-                  "Без научной формы очень малые числа могут округлиться до 0."),
+            text=("При |x| < 10^N (малые) или |x| ≥ 10^M (большие) используется "
+                  "m·10^k. В режиме знаков после запятой выбранная точность "
+                  "применяется к мантиссе m."),
             foreground="gray", wraplength=590, justify=tk.LEFT
-        ).grid(row=10, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+        ).grid(row=12, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
 
         # ---- Template picker ----
         frame_template = ttk.LabelFrame(
@@ -2664,6 +2695,7 @@ class ConverterApp:
                 self.angle_decimals_var, "Точность углов", 0, 20
             ),
             "sci_threshold": None,
+            "sci_threshold_large": None,
         }
         if mode == "decimal_places":
             settings["decimal_places"] = self._read_bounded_int(
@@ -2678,14 +2710,24 @@ class ConverterApp:
             )
         if self.use_sci_var.get():
             settings["sci_threshold"] = self._read_bounded_int(
-                self.sci_threshold_var, "Порог научной формы", -15, 0
+                self.sci_threshold_var, "Порог научной формы (малые числа)", -15, 0
+            )
+        if self.use_sci_large_var.get():
+            settings["sci_threshold_large"] = self._read_bounded_int(
+                self.sci_large_threshold_var, "Порог научной формы (большие числа)", 1, 20
             )
         return settings
 
     def toggle_sci(self):
-        """Enable/disable the sci-threshold spinbox."""
+        """Enable/disable the small-number sci-threshold spinbox."""
         self.sci_spinbox.config(
             state="normal" if self.use_sci_var.get() else "disabled"
+        )
+
+    def toggle_sci_large(self):
+        """Enable/disable the large-number sci-threshold spinbox."""
+        self.sci_large_spinbox.config(
+            state="normal" if self.use_sci_large_var.get() else "disabled"
         )
 
     def log(self, message):
@@ -2807,10 +2849,16 @@ class ConverterApp:
         self.log(f"[INFO] Точность углов: {MathcadParser.ANGLE_DECIMALS} знаков.")
         if MathcadParser.sci_threshold is not None:
             self.log(
-                f"[INFO] Научная форма: |x| < 10^{MathcadParser.sci_threshold}."
+                f"[INFO] Научная форма (малые): |x| < 10^{MathcadParser.sci_threshold}."
             )
         else:
-            self.log("[INFO] Научная форма отключена.")
+            self.log("[INFO] Научная форма для малых чисел отключена.")
+        if MathcadParser.sci_threshold_large is not None:
+            self.log(
+                f"[INFO] Научная форма (большие): |x| >= 10^{MathcadParser.sci_threshold_large}."
+            )
+        else:
+            self.log("[INFO] Научная форма для больших чисел отключена.")
 
         self.log("[INFO] Парсинг XML файла Mathcad...")
 
